@@ -5,6 +5,7 @@ import helmet from "helmet";
 import crypto from "crypto";
 import admin from "firebase-admin";
 import rateLimit from "express-rate-limit";
+import africastalking from "africastalking";
 import "dotenv/config";
 
 const app = express();
@@ -54,6 +55,15 @@ const collections = {
   fhirCache: db.collection('fhir_resource_cache')
 };
 
+// INITIALIZE AFRICA'S TALKING
+const AT = africastalking({
+  apiKey: process.env.AFRICASTALKING_API_KEY,
+  username: process.env.AFRICASTALKING_USERNAME
+});
+
+const sms = AT.SMS;
+console.log('✅ Africa\'s Talking SMS initialized');
+
 // RATE LIMITING
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -80,6 +90,60 @@ async function logAudit(event) {
     console.log('📝 AUDIT:', event.event);
   } catch (error) {
     console.error('Failed to log audit:', error);
+  }
+}
+
+// AFRICA'S TALKING SMS SERVICE
+async function sendOtpSms(phoneNumber, otp, patientNupi, requestingFacility) {
+  try {
+    // Format message
+    const message = `Your Health Information Exchange OTP is: ${otp}
+                    Valid for 5 minutes. Do NOT share this code.
+
+                    Patient ID: ${patientNupi}
+                    Requesting: ${requestingFacility}
+
+                    HIE Gateway`;
+
+    const options = {
+      to: [phoneNumber],
+      message: message,
+    };
+
+    // Add sender ID if provided
+    if (process.env.AFRICASTALKING_SENDER_ID) {
+      options.from = process.env.AFRICASTALKING_SENDER_ID;
+    }
+
+    console.log(`📱 Sending OTP SMS to ${phoneNumber}`);
+
+    const response = await sms.send(options);
+    
+    console.log('✅ SMS Response:', response);
+    
+    // Check if SMS was sent successfully
+    const recipient = response.SMSMessageData?.Recipients?.[0];
+    if (recipient && recipient.statusCode === 101) {
+      console.log('✅ SMS sent successfully');
+      return {
+        success: true,
+        messageId: recipient.messageId,
+        cost: recipient.cost
+      };
+    } else {
+      console.error('❌ SMS failed:', recipient?.status);
+      return {
+        success: false,
+        error: recipient?.status || 'SMS delivery failed'
+      };
+    }
+    
+  } catch (error) {
+    console.error('❌ SMS sending error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
   }
 }
 
@@ -513,6 +577,7 @@ app.post('/api/otp/request', async (req, res) => {
     const requestId = crypto.randomBytes(32).toString('hex');
     const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
 
+    // Save OTP request to Firestore
     await collections.otpRequests.doc(requestId).set({
       requestId,
       patientNupi,
@@ -526,7 +591,19 @@ app.post('/api/otp/request', async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt: new Date(Date.now() + 5 * 60 * 1000),
       ipAddress: req.ip,
-      userAgent: req.get('user-agent')
+      userAgent: req.get('user-agent'),
+      smsStatus: 'pending'
+    });
+
+    // SEND REAL SMS VIA AFRICA'S TALKING
+    const smsResult = await sendOtpSms(patientPhone, otp, patientNupi, requestingFacility);
+
+    // Update OTP request with SMS status
+    await collections.otpRequests.doc(requestId).update({
+      smsStatus: smsResult.success ? 'sent' : 'failed',
+      smsMessageId: smsResult.messageId || null,
+      smsCost: smsResult.cost || null,
+      smsError: smsResult.error || null
     });
 
     await logAudit({
@@ -535,22 +612,29 @@ app.post('/api/otp/request', async (req, res) => {
       patientNupi,
       facilityId: requestingFacility,
       success: true,
+      metadata: {
+        smsStatus: smsResult.success ? 'sent' : 'failed',
+        messageId: smsResult.messageId
+      },
       ipAddress: req.ip
     });
 
-    console.log(`📱 OTP ${otp} for ${patientNupi}`);
-
-    // In production: Send SMS via Africa's Talking
+    console.log(`OTP ${otp} for ${patientNupi} - SMS ${smsResult.success ? 'SENT' : 'FAILED'}`);
 
     res.json({
       success: true,
       requestId,
       expiresIn: 300,
-      message: `OTP sent to ${patientPhone}`,
-      _demoOtp: process.env.NODE_ENV === 'development' ? otp : undefined
+      message: smsResult.success 
+        ? `OTP sent to ${patientPhone}` 
+        : `OTP generated but SMS failed. Contact support.`,
+      smsDelivered: smsResult.success,
+      // Only show OTP in development if SMS failed
+      _demoOtp: (process.env.NODE_ENV === 'development' || !smsResult.success) ? otp : undefined
     });
 
   } catch (error) {
+    console.error('OTP request error:', error);
     await logAudit({
       event: 'otp_request_failed',
       eventCategory: 'auth',
@@ -650,7 +734,7 @@ app.post('/api/otp/verify', async (req, res) => {
       ipAddress: req.ip
     });
 
-    console.log(`✅ OTP verified for ${otpData.patientNupi}`);
+    console.log(`OTP verified for ${otpData.patientNupi}`);
 
     res.json({
       success: true,
