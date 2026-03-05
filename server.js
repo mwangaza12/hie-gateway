@@ -1,1026 +1,1134 @@
-import express from "express";
-import axios from "axios";
-import cors from "cors";
-import helmet from "helmet";
-import crypto from "crypto";
-import admin from "firebase-admin";
+/**
+ * AfyaLink Kenya — HIE Gateway + Blockchain  v4
+ * ═══════════════════════════════════════════════
+ *
+ * ARCHITECTURE
+ *
+ *  Ministry of Health (MoH)
+ *    - Only entity that can register facilities onto the network
+ *    - Each facility gets a one-time API key (stored as hash on blockchain)
+ *    - Can suspend / reactivate facilities
+ *    - Has full visibility of the chain
+ *
+ *  Facility authentication (how Hos A knows it's really Hos B querying)
+ *    - Every inter-facility request must carry X-Facility-Id + X-Api-Key headers
+ *    - Gateway verifies the API key hash against the blockchain record
+ *    - If key doesn't match → 401, request blocked, attempt logged on chain
+ *    - Hospital A's FHIR server is NEVER called directly by Hospital B
+ *      All queries go through the gateway which acts as the trusted broker
+ *
+ *  Patient journey
+ *    1. Patient visits Hos A → registered (PATIENT_REGISTERED block minted)
+ *    2. Hos A records encounters → ENCOUNTER_RECORDED block at Hos A
+ *    3. Patient visits Hos B → doctor submits nationalId + security answer
+ *       Gateway verifies identity, returns full history from Hos A
+ *       IDENTITY_VERIFIED + RECORD_ACCESSED blocks minted
+ *    4. Hos B records new encounters → ENCOUNTER_RECORDED block at Hos B
+ *    5. Chain now shows patient was at A then B — full immutable trail
+ *
+ *  Firestore layout
+ * 
+ *   facilities/                      HIE operational record
+ *   access_tokens/                   Post-verification bearer tokens
+ *   audit_log/                       Operational audit events
+ *
+ *   afyachain/meta                   { chain: [...all blocks] }
+ *   afyachain/facilities/docs/{id}   Blockchain facility record
+ *   afyachain/patients/docs/{nupi}   Patient registry
+ *   afyachain/consents/docs/{nupi}   { list: [...consents] }
+ *   afyachain/identities/docs/{nupi} Hashed answer + PIN
+ *   afyachain/staff/docs/{staffId}   Credentialed staff
+ *   afyachain/encounters/docs/{id}   Encounter index (for cross-facility query)
+ */
+
+import express   from "express";
+import axios     from "axios";
+import cors      from "cors";
+import helmet    from "helmet";
+import crypto    from "crypto";
+import admin     from "firebase-admin";
 import rateLimit from "express-rate-limit";
-import africastalking from "africastalking";
+import jwt       from "jsonwebtoken";
 import "dotenv/config";
 
+//  EXPRESS
+
 const app = express();
-
-// SECURITY HEADERS
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-      },
-    },
-  })
-);
-
-app.use(
-  cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(",") || "*",
-    credentials: true,
-  })
-);
-
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"] } } }));
+app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(",") || "*", credentials: true }));
 app.use(express.json({ limit: "10mb" }));
 
-// INITIALIZE FIREBASE
+//  FIREBASE
 
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      projectId:   process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
     }),
   });
 }
 
 const db = admin.firestore();
+console.log("✅ Firebase Firestore connected");
 
-console.log('✅ Firebase Firestore connected');
-
-// FIRESTORE COLLECTIONS
-const collections = {
-  facilities: db.collection('facilities'),
-  otpRequests: db.collection('otp_requests'),
-  accessTokens: db.collection('access_tokens'),
-  auditLog: db.collection('audit_log'),
-  fhirCache: db.collection('fhir_resource_cache')
+const col = {
+  facilities:   db.collection("facilities"),
+  accessTokens: db.collection("access_tokens"),
+  auditLog:     db.collection("audit_log"),
 };
 
-// INITIALIZE AFRICA'S TALKING
-const AT = africastalking({
-  apiKey: process.env.AFRICASTALKING_API_KEY,
-  username: process.env.AFRICASTALKING_USERNAME
-});
+const BC = "hie_chain";
+const cref = {
+  meta:      ()   => db.collection(BC).doc("meta"),
+  facility:  (id) => db.collection(BC).doc("facilities").collection("docs").doc(id),
+  facs:      ()   => db.collection(BC).doc("facilities").collection("docs"),
+  patient:   (id) => db.collection(BC).doc("patients").collection("docs").doc(id),
+  pats:      ()   => db.collection(BC).doc("patients").collection("docs"),
+  consent:   (id) => db.collection(BC).doc("consents").collection("docs").doc(id),
+  cons:      ()   => db.collection(BC).doc("consents").collection("docs"),
+  identity:  (id) => db.collection(BC).doc("identities").collection("docs").doc(id),
+  ids:       ()   => db.collection(BC).doc("identities").collection("docs"),
+  staff:     (id) => db.collection(BC).doc("staff").collection("docs").doc(id),
+  allStaff:  ()   => db.collection(BC).doc("staff").collection("docs"),
+  encounter: (id) => db.collection(BC).doc("encounters").collection("docs").doc(id),
+  encounters:()   => db.collection(BC).doc("encounters").collection("docs"),
+};
 
-const sms = AT.SMS;
-console.log('✅ Africa\'s Talking SMS initialized');
+//  BLOCKCHAIN ENGINE
 
-// RATE LIMITING
-const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: 'Too many requests, please try again later'
-});
+class AfyaChain {
+  constructor() {
+    this.chain      = [];
+    this.facilities = {};
+    this.patients   = {};
+    this.consents   = {};
+    this.identities = {};
+    this.staff      = {};
+    this.encounters = {}; // encounterId → { nupi, facilityId, date, type }
+    this._ready       = false;
+    this._initPromise = this._init();
+  }
 
-const otpLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: 'Too many OTP requests'
-});
+  async _init() {
+    try {
+      await this._loadAll();
+      if (!this.chain.length) await this._genesis();
+      this._ready = true;
+      console.log(`⛓  AfyaChain: ${this.chain.length} blocks | ${Object.keys(this.facilities).length} facilities | ${Object.keys(this.patients).length} patients | ${Object.keys(this.encounters).length} encounters`);
+    } catch (err) {
+      console.error("⛓  AfyaChain init failed —", err.message);
+      if (!this.chain.length) this._genesisSync();
+      this._ready = true;
+    }
+  }
 
-app.use('/api/', generalLimiter);
-app.use('/api/otp/', otpLimiter);
+  async ready() { if (!this._ready) await this._initPromise; }
 
-// AUDIT LOGGING
+  async _loadAll() {
+    const [meta, facSnap, patSnap, conSnap, idSnap, staffSnap, encSnap] = await Promise.all([
+      cref.meta().get(), cref.facs().get(), cref.pats().get(),
+      cref.cons().get(), cref.ids().get(),  cref.allStaff().get(),
+      cref.encounters().get(),
+    ]);
+    this.chain = meta.exists ? (meta.data().chain || []) : [];
+    facSnap.docs.forEach(d   => { this.facilities[d.id] = d.data(); });
+    patSnap.docs.forEach(d   => { this.patients[d.id]   = d.data(); });
+    conSnap.docs.forEach(d   => { this.consents[d.id]   = d.data().list || []; });
+    idSnap.docs.forEach(d    => { this.identities[d.id] = d.data(); });
+    staffSnap.docs.forEach(d => { this.staff[d.id]      = d.data(); });
+    encSnap.docs.forEach(d   => { this.encounters[d.id] = d.data(); });
+  }
+
+  async _persist(opts = {}) {
+    const batch = db.batch();
+    batch.set(cref.meta(), { chain: this.chain, updatedAt: new Date().toISOString() }, { merge: false });
+    if (opts.facility)   batch.set(cref.facility(opts.facility),   this.facilities[opts.facility]);
+    if (opts.patient)    batch.set(cref.patient(opts.patient),     this.patients[opts.patient]);
+    if (opts.consent)    batch.set(cref.consent(opts.consent),     { list: this.consents[opts.consent] || [] });
+    if (opts.identity)   batch.set(cref.identity(opts.identity),   this.identities[opts.identity]);
+    if (opts.staffId)    batch.set(cref.staff(opts.staffId),       this.staff[opts.staffId]);
+    if (opts.encounterId)batch.set(cref.encounter(opts.encounterId),this.encounters[opts.encounterId]);
+    await batch.commit();
+  }
+
+  // Crypto
+
+  static sha256(data) {
+    return crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
+  }
+  static hashSecret(s) {
+    return AfyaChain.sha256(s.toString().toLowerCase().trim());
+  }
+  static genNupi(nationalId, dob) {
+    return "NUPI-" + AfyaChain.sha256(
+      `${nationalId.toUpperCase().trim()}|${dob}|AFYALINK_KENYA_2025`
+    ).substring(0, 40).toUpperCase();
+  }
+
+  // Blocks
+
+  get _last() { return this.chain[this.chain.length - 1]; }
+
+  _mkBlock(type, data) {
+    const index    = this.chain.length;
+    const prevHash = this._last?.hash || "0".repeat(64);
+    const ts       = new Date().toISOString();
+    const body     = { index, type, data, timestamp: ts, previousHash: prevHash };
+    return { ...body, hash: AfyaChain.sha256({ ...body, nonce: index * 13 }) };
+  }
+
+  _genesisSync() {
+    this.chain.push(this._mkBlock("GENESIS", {
+      message: "AfyaLink Kenya Health Information Exchange",
+      version: "4.0.0", authority: "Ministry of Health Kenya",
+    }));
+  }
+
+  async _genesis() { this._genesisSync(); await this._persist(); }
+
+  async _append(type, data) {
+    const b = this._mkBlock(type, data);
+    this.chain.push(b);
+    return b;
+  }
+
+  // Facility registry (MoH only)─
+
+  async registerFacility({ facilityId, name, mohLicense, type, county, fhirUrl, adminEmail, approvedBy }) {
+    await this.ready();
+    if (this.facilities[facilityId]) return { success: false, error: "Facility already on chain" };
+
+    const apiKey  = "FAC-" + AfyaChain.sha256(facilityId + Date.now()).substring(0, 32).toUpperCase();
+    const keyHash = AfyaChain.sha256(apiKey);
+
+    const block = await this._append("FACILITY_REGISTERED", {
+      facilityId, name, mohLicense, type, county, fhirUrl, adminEmail, approvedBy, keyHash,
+    });
+
+    this.facilities[facilityId] = {
+      facilityId, name, mohLicense, type, county, fhirUrl, adminEmail,
+      status: "ACTIVE", registeredAt: block.timestamp, blockIndex: block.index, keyHash,
+    };
+
+    await this._persist({ facility: facilityId });
+    return { success: true, facilityId, apiKey, block };
+  }
+
+  async suspendFacility(facilityId, reason, by) {
+    await this.ready();
+    if (!this.facilities[facilityId]) return { success: false, error: "Not found" };
+    const block = await this._append("FACILITY_SUSPENDED", { facilityId, reason, suspendedBy: by });
+    this.facilities[facilityId].status = "SUSPENDED";
+    await this._persist({ facility: facilityId });
+    return { success: true, block };
+  }
+
+  async reactivateFacility(facilityId, by) {
+    await this.ready();
+    if (!this.facilities[facilityId]) return { success: false, error: "Not found" };
+    const block = await this._append("FACILITY_REACTIVATED", { facilityId, reactivatedBy: by });
+    this.facilities[facilityId].status = "ACTIVE";
+    await this._persist({ facility: facilityId });
+    return { success: true, block };
+  }
+
+  // Facility API key verification─
+  //
+  // This is the core trust mechanism.
+  // When Facility B wants to query the gateway:
+  //   - It sends X-Facility-Id: NBI-001 and X-Api-Key: FAC-XXXXX
+  //   - Gateway hashes the key and compares to keyHash stored on blockchain
+  //   - Match → legitimate facility. No match → blocked + logged.
+
+  async verifyFacilityKey(facilityId, apiKey) {
+    await this.ready();
+    const fac = this.facilities[facilityId];
+    if (!fac)                     return { valid: false, reason: "Facility not registered on AfyaNet" };
+    if (fac.status !== "ACTIVE")  return { valid: false, reason: `Facility is ${fac.status}` };
+    const match = AfyaChain.sha256(apiKey) === fac.keyHash;
+    return match ? { valid: true, facility: fac } : { valid: false, reason: "Invalid API key" };
+  }
+
+  getFacility(facilityId) { return this.facilities[facilityId] || null; }
+  listFacilities()        { return Object.values(this.facilities); }
+
+  // Staff─
+
+  async credentialStaff({ staffId, facilityId, name, role, addedBy }) {
+    await this.ready();
+    const block = await this._append("STAFF_CREDENTIALED", { staffId, facilityId, name, role, addedBy });
+    this.staff[staffId] = { staffId, facilityId, name, role, credentialedAt: block.timestamp };
+    await this._persist({ staffId });
+    return { success: true, block };
+  }
+
+  // Patient registry
+
+  async registerPatient({ nationalId, dob, name, securityQuestion, securityAnswer, pin, facilityId }) {
+    await this.ready();
+    const nupi = AfyaChain.genNupi(nationalId, dob);
+    if (this.patients[nupi]) return { success: true, nupi, alreadyExists: true };
+
+    this.identities[nupi] = {
+      question:       securityQuestion,
+      answerHash:     AfyaChain.hashSecret(securityAnswer),
+      pinHash:        AfyaChain.hashSecret(pin),
+      failedAttempts: 0,
+      lockedUntil:    null,
+    };
+
+    const block = await this._append("PATIENT_REGISTERED", {
+      nupi,
+      idMasked:     nationalId.slice(0, 2) + "****" + nationalId.slice(-2),
+      dobYear:      dob.split("-")[0],
+      registeredAt: facilityId,
+    });
+
+    this.patients[nupi] = {
+      nupi, name, facilityId,
+      facilitiesVisited: [facilityId],   // track every facility this patient has been to
+      registeredAt: block.timestamp,
+      blockIndex:   block.index,
+    };
+
+    // Default network consent
+    if (!this.consents[nupi]) this.consents[nupi] = [];
+    this.consents[nupi].push({
+      consentId:   "NETCON-" + nupi.slice(5, 21),
+      facilityId:  "ALL_NETWORK",
+      consentType: "NETWORK_DEFAULT",
+      status:      "ACTIVE",
+      grantedAt:   block.timestamp,
+      expiresAt:   null,
+    });
+
+    await this._persist({ patient: nupi, consent: nupi, identity: nupi });
+    return { success: true, nupi, alreadyExists: false, block };
+  }
+
+  generateNupi(nationalId, dob) { return AfyaChain.genNupi(nationalId, dob); }
+  getPatient(nupi)               { return this.patients[nupi] || null; }
+
+  // Encounter recording─
+  //
+  // Called by a facility after recording an encounter in their own system.
+  // The blockchain stores a lightweight index — not the full clinical data
+  // (that stays on the facility's FHIR server). The index lets any authorised
+  // facility ask "which facilities have encounters for this patient?"
+
+  async recordEncounter({ nupi, facilityId, encounterId, encounterType, encounterDate, chiefComplaint, practitionerName }) {
+    await this.ready();
+    if (!this.patients[nupi]) return { success: false, error: "Patient not on AfyaNet" };
+
+    const block = await this._append("ENCOUNTER_RECORDED", {
+      nupi, facilityId, encounterId, encounterType,
+      encounterDate: encounterDate || new Date().toISOString(),
+      chiefComplaint: chiefComplaint || null,
+      practitionerName: practitionerName || null,
+    });
+
+    // Store lightweight index
+    this.encounters[encounterId] = {
+      encounterId, nupi, facilityId, encounterType,
+      encounterDate: encounterDate || block.timestamp,
+      blockIndex: block.index,
+    };
+
+    // Track which facilities this patient has visited
+    const patient = this.patients[nupi];
+    if (!patient.facilitiesVisited.includes(facilityId)) {
+      patient.facilitiesVisited.push(facilityId);
+    }
+    patient.lastSeenAt       = facilityId;
+    patient.lastEncounterDate = block.timestamp;
+
+    await this._persist({ patient: nupi, encounterId });
+    return { success: true, encounterId, blockIndex: block.index, block };
+  }
+
+  // Get all facilities a patient has visited (from blockchain index)
+  getPatientFacilities(nupi) {
+    const patient = this.patients[nupi];
+    if (!patient) return [];
+    return patient.facilitiesVisited || [];
+  }
+
+  // Get encounter index for a patient (which encounters, at which facilities)
+  getPatientEncounterIndex(nupi) {
+    return Object.values(this.encounters).filter(e => e.nupi === nupi);
+  }
+
+  // Consent─
+
+  async grantConsent({ nupi, facilityId, consentType, durationDays, notes, grantedBy }) {
+    await this.ready();
+    if (!this.consents[nupi]) this.consents[nupi] = [];
+    const consentId = "CON-" + AfyaChain.sha256(nupi + facilityId + Date.now()).slice(0, 16).toUpperCase();
+    const expiresAt = durationDays ? new Date(Date.now() + durationDays * 86400000).toISOString() : null;
+    const block = await this._append("CONSENT_GRANTED", { nupi, facilityId, consentType, expiresAt, grantedBy });
+    this.consents[nupi].push({ consentId, facilityId, consentType, status: "ACTIVE", grantedAt: block.timestamp, expiresAt, notes });
+    await this._persist({ consent: nupi });
+    return { success: true, consentId, block };
+  }
+
+  async revokeConsent(nupi, consentId, by) {
+    await this.ready();
+    const c = (this.consents[nupi] || []).find(x => x.consentId === consentId);
+    if (!c) return { success: false, error: "Consent not found" };
+    c.status = "REVOKED";
+    const block = await this._append("CONSENT_REVOKED", { nupi, consentId, revokedBy: by });
+    await this._persist({ consent: nupi });
+    return { success: true, block };
+  }
+
+  hasConsent(nupi, facilityId) {
+    const now = new Date();
+    return (this.consents[nupi] || []).some(c =>
+      (c.facilityId === facilityId || c.facilityId === "ALL_NETWORK") &&
+      c.status === "ACTIVE" && (!c.expiresAt || new Date(c.expiresAt) > now)
+    );
+  }
+
+  listConsents(nupi) { return this.consents[nupi] || []; }
+
+  // Identity verification─
+
+  getSecurityQuestion(nationalId, dob) {
+    const nupi = AfyaChain.genNupi(nationalId, dob);
+    const id   = this.identities[nupi];
+    if (!id) return { found: false };
+    return { found: true, nupi, question: id.question };
+  }
+
+  async verifyByAnswer(nationalId, dob, answer) {
+    return this._checkSecret(AfyaChain.genNupi(nationalId, dob), nationalId, "answer", answer);
+  }
+
+  async verifyByPin(nationalId, dob, pin) {
+    return this._checkSecret(AfyaChain.genNupi(nationalId, dob), nationalId, "pin", pin);
+  }
+
+  async _checkSecret(nupi, nationalId, type, value) {
+    await this.ready();
+    if (!this.patients[nupi]) return { success: false, error: "Patient not registered on AfyaNet" };
+    const id = this.identities[nupi];
+    if (!id) return { success: false, error: "Identity record not found" };
+    if (id.lockedUntil && new Date(id.lockedUntil) > new Date())
+      return { success: false, locked: true, error: `Account locked until ${id.lockedUntil}` };
+
+    const field = type === "pin" ? "pinHash" : "answerHash";
+    if (AfyaChain.hashSecret(value) !== id[field]) {
+      id.failedAttempts = (id.failedAttempts || 0) + 1;
+      if (id.failedAttempts >= 5)
+        id.lockedUntil = new Date(Date.now() + 30 * 60000).toISOString();
+      await this._persist({ identity: nupi });
+      return { success: false, error: `Incorrect ${type === "pin" ? "PIN" : "answer"}. ${Math.max(0, 5 - id.failedAttempts)} attempts remaining.`, attemptsRemaining: Math.max(0, 5 - id.failedAttempts) };
+    }
+
+    id.failedAttempts = 0;
+    id.lockedUntil    = null;
+    await this._append("IDENTITY_VERIFIED", {
+      nupi, method: type,
+      idMasked: nationalId.slice(0, 2) + "****" + nationalId.slice(-2),
+    });
+    await this._persist({ identity: nupi });
+    return { success: true, nupi, patient: this.patients[nupi] };
+  }
+
+  // Referral
+
+  async logReferral({ nupi, fromFacility, toFacility, reason, urgency, issuedBy }) {
+    await this.ready();
+    const referralId = "REF-" + AfyaChain.sha256(nupi + Date.now()).slice(0, 16).toUpperCase();
+    const block = await this._append("REFERRAL_ISSUED", { referralId, nupi, fromFacility, toFacility, reason, urgency, issuedBy });
+    await this._persist();
+    return { success: true, referralId, block };
+  }
+
+  async logAccess(nupi, eventType, actor, details = {}) {
+    await this.ready();
+    const block = await this._append(eventType, { nupi, actor, ...details });
+    await this._persist();
+    return block;
+  }
+
+  // Audit / stats─
+
+  getAuditTrail(nupi) { return this.chain.filter(b => b.data?.nupi === nupi); }
+
+  verifyIntegrity() {
+    for (let i = 1; i < this.chain.length; i++) {
+      const b = this.chain[i], prev = this.chain[i - 1];
+      if (b.previousHash !== prev.hash) return { valid: false, brokenAt: i };
+      const { hash, ...rest } = b;
+      if (AfyaChain.sha256({ ...rest, nonce: b.index * 13 }) !== hash) return { valid: false, tamperedAt: i };
+    }
+    return { valid: true, blocks: this.chain.length };
+  }
+
+  getStats() {
+    const types = {};
+    this.chain.forEach(b => { types[b.type] = (types[b.type] || 0) + 1; });
+    return {
+      totalBlocks:      this.chain.length,
+      facilities:       Object.keys(this.facilities).length,
+      activeFacilities: Object.values(this.facilities).filter(f => f.status === "ACTIVE").length,
+      patients:         Object.keys(this.patients).length,
+      encounters:       Object.keys(this.encounters).length,
+      eventTypes:       types,
+      latestBlock:      this._last,
+    };
+  }
+
+  recentBlocks(n = 20) { return this.chain.slice(-n).reverse(); }
+}
+
+const chain = new AfyaChain();
+
+//  RATE LIMITING
+
+const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: "Too many requests" });
+const verifyLimiter  = rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  message: "Too many verification attempts" });
+const mohLimiter     = rateLimit({ windowMs: 15 * 60 * 1000, max: 30,  message: "Too many MoH requests" });
+
+app.use("/api/",        generalLimiter);
+app.use("/api/verify/", verifyLimiter);
+app.use("/api/moh/",    mohLimiter);
+
+//  AUDIT LOGGING
+
 async function logAudit(event) {
   try {
-    await collections.auditLog.add({
-      ...event,
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-    console.log('📝 AUDIT:', event.event);
-  } catch (error) {
-    console.error('Failed to log audit:', error);
+    await col.auditLog.add({ ...event, timestamp: admin.firestore.FieldValue.serverTimestamp() });
+    console.log("📝 AUDIT:", event.event);
+  } catch (err) {
+    console.error("Audit log failed:", err.message);
   }
 }
 
-// AFRICA'S TALKING SMS SERVICE
-async function sendOtpSms(phoneNumber, otp, patientNupi, requestingFacility) {
-  try {
-    // Format message
-    const message = `Your Health Information Exchange OTP is: ${otp}
-                    Valid for 5 minutes. Do NOT share this code.
+//  FHIR R4 UTILITIES
 
-                    Patient ID: ${patientNupi}
-                    Requesting: ${requestingFacility}
-
-                    HIE Gateway`;
-
-    const options = {
-      to: [phoneNumber],
-      message: message,
-    };
-
-    // Add sender ID if provided
-    if (process.env.AFRICASTALKING_SENDER_ID) {
-      options.from = process.env.AFRICASTALKING_SENDER_ID;
-    }
-
-    console.log(`📱 Sending OTP SMS to ${phoneNumber}`);
-
-    const response = await sms.send(options);
-    
-    console.log('✅ SMS Response:', response);
-    
-    // Check if SMS was sent successfully
-    const recipient = response.SMSMessageData?.Recipients?.[0];
-    if (recipient && recipient.statusCode === 101) {
-      console.log('✅ SMS sent successfully');
-      return {
-        success: true,
-        messageId: recipient.messageId,
-        cost: recipient.cost
-      };
-    } else {
-      console.error('❌ SMS failed:', recipient?.status);
-      return {
-        success: false,
-        error: recipient?.status || 'SMS delivery failed'
-      };
-    }
-    
-  } catch (error) {
-    console.error('❌ SMS sending error:', error);
-    return {
-      success: false,
-      error: error.message
-    };
-  }
-}
-
-// FHIR R4 UTILITIES
 const FHIR = {
-  /**
-   * Convert internal patient to FHIR R4 Patient resource
-   */
-  toPatient(patient) {
+  createBundle(type = "collection", entries = []) {
     return {
-      resourceType: 'Patient',
-      id: patient.nupi,
-      identifier: [
-        {
-          system: 'http://kenya.go.ke/fhir/identifier/nupi',
-          value: patient.nupi,
-          use: 'official'
-        }
-      ],
-      active: true,
-      name: [
-        {
-          use: 'official',
-          family: patient.lastName,
-          given: [patient.firstName, patient.middleName].filter(Boolean)
-        }
-      ],
-      telecom: [
-        patient.phoneNumber && {
-          system: 'phone',
-          value: patient.phoneNumber,
-          use: 'mobile'
-        },
-        patient.email && {
-          system: 'email',
-          value: patient.email
-        }
-      ].filter(Boolean),
-      gender: patient.gender === 'male' ? 'male' : patient.gender === 'female' ? 'female' : 'other',
-      birthDate: patient.dateOfBirth,
-      address: patient.address ? [
-        {
-          use: 'home',
-          type: 'physical',
-          country: 'KE',
-          state: patient.address.county,
-          district: patient.address.subCounty,
-          city: patient.address.ward,
-          text: `${patient.address.village}, ${patient.address.ward}, ${patient.address.subCounty}, ${patient.address.county}, Kenya`
-        }
-      ] : [],
-      meta: {
-        versionId: '1',
-        lastUpdated: patient.updatedAt || new Date().toISOString(),
-        profile: ['http://hl7.org/fhir/StructureDefinition/Patient']
-      }
-    };
-  },
-
-  /**
-   * Convert internal encounter to FHIR R4 Encounter resource
-   */
-  toEncounter(encounter) {
-    return {
-      resourceType: 'Encounter',
-      id: encounter.id,
-      identifier: [
-        {
-          system: `http://${encounter.facilityId}/fhir/encounter`,
-          value: encounter.id
-        }
-      ],
-      status: encounter.status || 'finished',
-      class: {
-        system: 'http://terminology.hl7.org/CodeSystem/v3-ActCode',
-        code: encounter.encounterType === 'inpatient' ? 'IMP' : 
-              encounter.encounterType === 'emergency' ? 'EMER' : 'AMB',
-        display: encounter.encounterType === 'inpatient' ? 'inpatient encounter' : 
-                encounter.encounterType === 'emergency' ? 'emergency' : 'ambulatory'
-      },
-      subject: {
-        reference: `Patient/${encounter.patientNupi}`,
-        display: `NUPI: ${encounter.patientNupi}`
-      },
-      period: {
-        start: encounter.encounterDate,
-        end: encounter.encounterDate
-      },
-      reasonCode: encounter.chiefComplaint ? [
-        {
-          coding: [],
-          text: encounter.chiefComplaint
-        }
-      ] : [],
-      serviceProvider: {
-        reference: `Organization/${encounter.facilityId}`,
-        display: encounter.facilityName
-      },
-      participant: encounter.practitionerName ? [
-        {
-          individual: {
-            display: encounter.practitionerName
-          }
-        }
-      ] : [],
-      meta: {
-        versionId: '1',
-        lastUpdated: encounter.createdAt || new Date().toISOString(),
-        source: encounter.facilityId,
-        profile: ['http://hl7.org/fhir/StructureDefinition/Encounter']
-      }
-    };
-  },
-
-  /**
-   * Convert vital signs to FHIR R4 Observation resources
-   */
-  toObservations(vitalSigns, encounterId, patientNupi) {
-    if (!vitalSigns) return [];
-
-    const observations = [];
-    const vitalMap = {
-      temperature: { 
-        code: '8310-5', 
-        display: 'Body temperature', 
-        unit: 'Cel',
-        system: 'http://unitsofmeasure.org'
-      },
-      pulse: { 
-        code: '8867-4', 
-        display: 'Heart rate', 
-        unit: '/min',
-        system: 'http://unitsofmeasure.org'
-      },
-      bloodPressureSystolic: { 
-        code: '8480-6', 
-        display: 'Systolic blood pressure', 
-        unit: 'mm[Hg]',
-        system: 'http://unitsofmeasure.org'
-      },
-      bloodPressureDiastolic: { 
-        code: '8462-4', 
-        display: 'Diastolic blood pressure', 
-        unit: 'mm[Hg]',
-        system: 'http://unitsofmeasure.org'
-      },
-      respiratoryRate: { 
-        code: '9279-1', 
-        display: 'Respiratory rate', 
-        unit: '/min',
-        system: 'http://unitsofmeasure.org'
-      },
-      oxygenSaturation: { 
-        code: '2708-6', 
-        display: 'Oxygen saturation', 
-        unit: '%',
-        system: 'http://unitsofmeasure.org'
-      },
-      weight: { 
-        code: '29463-7', 
-        display: 'Body weight', 
-        unit: 'kg',
-        system: 'http://unitsofmeasure.org'
-      },
-      height: { 
-        code: '8302-2', 
-        display: 'Body height', 
-        unit: 'cm',
-        system: 'http://unitsofmeasure.org'
-      }
-    };
-
-    Object.entries(vitalSigns).forEach(([key, value]) => {
-      if (vitalMap[key] && value != null) {
-        const vital = vitalMap[key];
-        observations.push({
-          resourceType: 'Observation',
-          id: `${encounterId}-obs-${key}`,
-          status: 'final',
-          category: [
-            {
-              coding: [
-                {
-                  system: 'http://terminology.hl7.org/CodeSystem/observation-category',
-                  code: 'vital-signs',
-                  display: 'Vital Signs'
-                }
-              ]
-            }
-          ],
-          code: {
-            coding: [
-              {
-                system: 'http://loinc.org',
-                code: vital.code,
-                display: vital.display
-              }
-            ],
-            text: vital.display
-          },
-          subject: {
-            reference: `Patient/${patientNupi}`
-          },
-          encounter: {
-            reference: `Encounter/${encounterId}`
-          },
-          effectiveDateTime: new Date().toISOString(),
-          valueQuantity: {
-            value: parseFloat(value),
-            unit: vital.unit,
-            system: vital.system,
-            code: vital.unit
-          },
-          meta: {
-            profile: ['http://hl7.org/fhir/StructureDefinition/vitalsigns']
-          }
-        });
-      }
-    });
-
-    return observations;
-  },
-
-  /**
-   * Convert diagnoses to FHIR R4 Condition resources
-   */
-  toConditions(diagnoses, encounterId, patientNupi) {
-    if (!diagnoses || !Array.isArray(diagnoses)) return [];
-
-    return diagnoses.map((diagnosis, index) => ({
-      resourceType: 'Condition',
-      id: `${encounterId}-cond-${index}`,
-      clinicalStatus: {
-        coding: [
-          {
-            system: 'http://terminology.hl7.org/CodeSystem/condition-clinical',
-            code: 'active',
-            display: 'Active'
-          }
-        ]
-      },
-      verificationStatus: {
-        coding: [
-          {
-            system: 'http://terminology.hl7.org/CodeSystem/condition-ver-status',
-            code: 'confirmed',
-            display: 'Confirmed'
-          }
-        ]
-      },
-      category: [
-        {
-          coding: [
-            {
-              system: 'http://terminology.hl7.org/CodeSystem/condition-category',
-              code: 'encounter-diagnosis',
-              display: 'Encounter Diagnosis'
-            }
-          ]
-        }
-      ],
-      code: {
-        coding: [],
-        text: diagnosis.name || diagnosis
-      },
-      subject: {
-        reference: `Patient/${patientNupi}`
-      },
-      encounter: {
-        reference: `Encounter/${encounterId}`
-      },
-      recordedDate: new Date().toISOString(),
-      meta: {
-        profile: ['http://hl7.org/fhir/StructureDefinition/Condition']
-      }
-    }));
-  },
-
-  /**
-   * Create FHIR R4 Bundle
-   */
-  createBundle(type = 'collection', entries = []) {
-    return {
-      resourceType: 'Bundle',
-      type: type,
-      id: `bundle-${crypto.randomBytes(8).toString('hex')}`,
-      meta: {
-        lastUpdated: new Date().toISOString()
-      },
+      resourceType: "Bundle", type,
+      id: `bundle-${crypto.randomBytes(8).toString("hex")}`,
+      meta: { lastUpdated: new Date().toISOString() },
       total: entries.length,
-      entry: entries.map(resource => ({
-        fullUrl: `${resource.resourceType}/${resource.id}`,
-        resource: resource
-      }))
+      entry: entries.map(r => ({ fullUrl: `${r.resourceType}/${r.id}`, resource: r })),
     };
   },
-
-  /**
-   * Create FHIR OperationOutcome (for errors)
-   */
   operationOutcome(severity, code, diagnostics) {
-    return {
-      resourceType: 'OperationOutcome',
-      issue: [
-        {
-          severity: severity, // fatal, error, warning, information
-          code: code, // e.g., 'not-found', 'processing', 'invalid'
-          diagnostics: diagnostics
-        }
-      ]
-    };
-  }
+    return { resourceType: "OperationOutcome", issue: [{ severity, code, diagnostics }] };
+  },
 };
 
-// REGISTER FACILITY
-app.post('/api/facilities/register', async (req, res) => {
+//  MIDDLEWARE — MoH JWT
+
+const MOH_SECRET = process.env.MOH_JWT_SECRET || "moh_dev_secret_change_me";
+
+function signMohToken(email) {
+  return jwt.sign({ email, role: "MOH_ADMIN" }, MOH_SECRET, { expiresIn: "10h" });
+}
+
+function requireMoH(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) return res.status(401).json({ error: "MoH token required" });
   try {
-    const { facilityId, name, apiUrl, apiKey, fhirEndpoints, contactEmail, address } = req.body;
-
-    if (!facilityId || !name || !apiUrl || !fhirEndpoints) {
-      return res.status(400).json({
-        success: false,
-        error: 'facilityId, name, apiUrl, and fhirEndpoints are required'
-      });
-    }
-
-    // Check if exists
-    const existingDoc = await collections.facilities.doc(facilityId).get();
-    if (existingDoc.exists) {
-      return res.status(409).json({
-        success: false,
-        error: 'Facility already registered'
-      });
-    }
-
-    const apiKeyHash = apiKey ? crypto.createHash('sha256').update(apiKey).digest('hex') : null;
-
-    // Default FHIR R4 endpoints
-    const defaultEndpoints = {
-      patient: '/fhir/Patient/:id',
-      encounter: '/fhir/Encounter?patient=:id',
-      observation: '/fhir/Observation?patient=:id',
-      condition: '/fhir/Condition?patient=:id',
-      bundle: '/fhir/Patient/:id/$everything',
-      ...fhirEndpoints
-    };
-
-    await collections.facilities.doc(facilityId).set({
-      facilityId,
-      name,
-      apiUrl,
-      apiKeyHash,
-      fhirVersion: 'R4',
-      fhirEndpoints: defaultEndpoints,
-      contactEmail: contactEmail || null,
-      address: address || null,
-      active: true,
-      verified: false,
-      registeredAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    await logAudit({
-      event: 'facility_registered',
-      eventCategory: 'admin',
-      facilityId,
-      action: 'create',
-      success: true,
-      ipAddress: req.ip,
-      metadata: { name, apiUrl, fhirVersion: 'R4' }
-    });
-
-    console.log(`✅ Facility registered: ${name} (FHIR R4)`);
-
-    res.json({
-      success: true,
-      message: `Facility ${name} registered with FHIR R4 support`
-    });
-
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// LIST FACILITIES
-app.get('/api/facilities', async (req, res) => {
-  try {
-    const snapshot = await collections.facilities
-      .where('active', '==', true)
-      .get();
-
-    const facilities = snapshot.docs.map(doc => {
-      const data = doc.data();
-      return {
-        facilityId: data.facilityId,
-        name: data.name,
-        apiUrl: data.apiUrl,
-        fhirVersion: data.fhirVersion,
-        fhirEndpoints: data.fhirEndpoints,
-        contactEmail: data.contactEmail,
-        active: data.active,
-        verified: data.verified
-      };
-    });
-
-    res.json({
-      success: true,
-      facilities,
-      count: facilities.length
-    });
-
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// REQUEST OTP
-app.post('/api/otp/request', async (req, res) => {
-  try {
-    const { patientNupi, patientPhone, requestingFacility, requestingUser } = req.body;
-
-    if (!patientNupi || !patientPhone || !requestingFacility) {
-      return res.status(400).json({
-        success: false,
-        error: 'patientNupi, patientPhone, and requestingFacility are required'
-      });
-    }
-
-    const otp = crypto.randomInt(100000, 999999).toString();
-    const requestId = crypto.randomBytes(32).toString('hex');
-    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-
-    // Save OTP request to Firestore
-    await collections.otpRequests.doc(requestId).set({
-      requestId,
-      patientNupi,
-      patientPhone,
-      requestingFacility,
-      requestingUser: requestingUser || 'anonymous',
-      otpHash,
-      status: 'pending',
-      attempts: 0,
-      maxAttempts: 3,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent'),
-      smsStatus: 'pending'
-    });
-
-    // SEND REAL SMS VIA AFRICA'S TALKING
-    // const smsResult = await sendOtpSms(patientPhone, otp, patientNupi, requestingFacility);
-    const smsResult = { success: true };
-    
-    // Update OTP request with SMS status
-    await collections.otpRequests.doc(requestId).update({
-      smsStatus: smsResult.success ? 'sent' : 'failed',
-      smsMessageId: smsResult.messageId || null,
-      smsCost: smsResult.cost || null,
-      smsError: smsResult.error || null
-    });
-
-    await logAudit({
-      event: 'otp_requested',
-      eventCategory: 'auth',
-      patientNupi,
-      facilityId: requestingFacility,
-      success: true,
-      metadata: {
-        smsStatus: smsResult.success ? 'sent' : 'failed',
-        messageId: smsResult.messageId
-      },
-      ipAddress: req.ip
-    });
-
-    console.log(`OTP ${otp} for ${patientNupi} - SMS ${smsResult.success ? 'SENT' : 'FAILED'}`);
-
-    res.json({
-      success: true,
-      requestId,
-      expiresIn: 300,
-      message: smsResult.success 
-        ? `OTP sent to ${patientPhone}` 
-        : `OTP generated but SMS failed. Contact support.`,
-      smsDelivered: smsResult.success,
-      // Only show OTP in development if SMS failed
-      _demoOtp: (process.env.NODE_ENV === 'development' || !smsResult.success) ? otp : undefined
-    });
-
-  } catch (error) {
-    console.error('OTP request error:', error);
-    await logAudit({
-      event: 'otp_request_failed',
-      eventCategory: 'auth',
-      success: false,
-      errorMessage: error.message,
-      ipAddress: req.ip
-    });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// VERIFY OTP
-app.post('/api/otp/verify', async (req, res) => {
-  try {
-    const { requestId, otp } = req.body;
-
-    if (!requestId || !otp) {
-      return res.status(400).json({
-        success: false,
-        error: 'requestId and otp are required'
-      });
-    }
-
-    const otpDoc = await collections.otpRequests.doc(requestId).get();
-
-    if (!otpDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        error: 'OTP request not found'
-      });
-    }
-
-    const otpData = otpDoc.data();
-
-    if (otpData.status !== 'pending') {
-      return res.status(400).json({
-        success: false,
-        error: `OTP already ${otpData.status}`
-      });
-    }
-
-    if (otpData.expiresAt.toDate() < new Date()) {
-      await collections.otpRequests.doc(requestId).update({ status: 'expired' });
-      return res.status(400).json({
-        success: false,
-        error: 'OTP expired'
-      });
-    }
-
-    if (otpData.attempts >= otpData.maxAttempts) {
-      await collections.otpRequests.doc(requestId).update({ status: 'denied' });
-      return res.status(429).json({
-        success: false,
-        error: 'Too many failed attempts'
-      });
-    }
-
-    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-
-    if (otpHash !== otpData.otpHash) {
-      await collections.otpRequests.doc(requestId).update({
-        attempts: admin.firestore.FieldValue.increment(1)
-      });
-      return res.status(400).json({
-        success: false,
-        error: `Invalid OTP. ${otpData.maxAttempts - otpData.attempts - 1} attempts remaining`
-      });
-    }
-
-    // OTP VERIFIED!
-    await collections.otpRequests.doc(requestId).update({
-      status: 'verified',
-      verifiedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Create access token
-    const accessToken = crypto.randomBytes(32).toString('hex');
-    await collections.accessTokens.doc(accessToken).set({
-      token: accessToken,
-      otpRequestId: requestId,
-      patientNupi: otpData.patientNupi,
-      requestingFacility: otpData.requestingFacility,
-      scopes: ['read:Patient', 'read:Encounter', 'read:Observation', 'read:Condition', 'read:Bundle'],
-      grantedAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      useCount: 0,
-      maxUses: 100
-    });
-
-    await logAudit({
-      event: 'otp_verified',
-      eventCategory: 'auth',
-      patientNupi: otpData.patientNupi,
-      facilityId: otpData.requestingFacility,
-      success: true,
-      consentMethod: 'otp',
-      ipAddress: req.ip
-    });
-
-    console.log(`OTP verified for ${otpData.patientNupi}`);
-
-    res.json({
-      success: true,
-      token: accessToken,
-      patientNupi: otpData.patientNupi,
-      expiresIn: 86400,
-      scopes: ['read:Patient', 'read:Encounter', 'read:Observation', 'read:Condition']
-    });
-
-  } catch (error) {
-    await logAudit({
-      event: 'otp_verification_error',
-      eventCategory: 'auth',
-      success: false,
-      errorMessage: error.message,
-      ipAddress: req.ip
-    });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// VERIFY ACCESS TOKEN MIDDLEWARE
-async function verifyAccessToken(req, res, next) {
-  try {
-    const token = req.headers['x-access-token'] || 
-                 req.headers['authorization']?.replace('Bearer ', '');
-
-    if (!token) {
-      return res.status(401).json(FHIR.operationOutcome('error', 'security', 'Access token required'));
-    }
-
-    const tokenDoc = await collections.accessTokens.doc(token).get();
-
-    if (!tokenDoc.exists) {
-      await logAudit({
-        event: 'invalid_access_token',
-        eventCategory: 'auth',
-        success: false,
-        ipAddress: req.ip
-      });
-      return res.status(401).json(FHIR.operationOutcome('error', 'security', 'Invalid access token'));
-    }
-
-    const tokenData = tokenDoc.data();
-
-    if (tokenData.expiresAt.toDate() < new Date()) {
-      return res.status(401).json(FHIR.operationOutcome('error', 'security', 'Access token expired'));
-    }
-
-    if (tokenData.useCount >= tokenData.maxUses) {
-      return res.status(429).json(FHIR.operationOutcome('error', 'throttled', 'Access token usage limit exceeded'));
-    }
-
-    await collections.accessTokens.doc(token).update({
-      useCount: admin.firestore.FieldValue.increment(1),
-      lastUsedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    req.accessToken = tokenData;
+    const payload = jwt.verify(auth.slice(7), MOH_SECRET);
+    if (payload.role !== "MOH_ADMIN") return res.status(403).json({ error: "MoH role required" });
+    req.moh = payload;
     next();
-
-  } catch (error) {
-    console.error('Token verification error:', error);
-    res.status(500).json(FHIR.operationOutcome('error', 'exception', error.message));
+  } catch {
+    res.status(401).json({ error: "Invalid or expired MoH token" });
   }
 }
 
-// GET FHIR PATIENT
-app.get('/api/fhir/Patient/:nupi', verifyAccessToken, async (req, res) => {
+//  MIDDLEWARE — Facility API key
+//
+//  Every inter-facility request must include:
+//    X-Facility-Id: NBI-001
+//    X-Api-Key:     FAC-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+//
+//  The gateway hashes the key and compares to the blockchain record.
+//  This is how Hospital A knows it's really Hospital B — not a random server.
+
+async function requireFacility(req, res, next) {
+  const facilityId = req.headers["x-facility-id"];
+  const apiKey     = req.headers["x-api-key"];
+
+  if (!facilityId || !apiKey)
+    return res.status(401).json({ error: "X-Facility-Id and X-Api-Key headers required" });
+
+  const check = await chain.verifyFacilityKey(facilityId, apiKey);
+
+  if (!check.valid) {
+    // Log the failed attempt on the blockchain — immutable record of intrusion attempts
+    await chain.logAccess("SYSTEM", "UNAUTHORIZED_ACCESS_ATTEMPT", facilityId, {
+      reason: check.reason,
+      ip: req.ip,
+      path: req.path,
+    });
+    await logAudit({ event: "unauthorized_facility_attempt", facilityId, reason: check.reason, ipAddress: req.ip, success: false });
+    return res.status(401).json({ error: check.reason });
+  }
+
+  req.facility = check.facility;
+  req.facilityId = facilityId;
+  next();
+}
+
+//  MIDDLEWARE — Patient access token (post-verification)
+
+async function requireAccessToken(req, res, next) {
   try {
-    const { nupi } = req.params;
-    const facilityId = req.query.facility || req.accessToken.requestingFacility;
+    const token = req.headers["x-access-token"] || req.headers["authorization"]?.replace("Bearer ", "");
+    if (!token) return res.status(401).json(FHIR.operationOutcome("error", "security", "Access token required"));
 
-    const facilityDoc = await collections.facilities.doc(facilityId).get();
-
-    if (!facilityDoc.exists) {
-      return res.status(404).json(FHIR.operationOutcome('error', 'not-found', 'Facility not found'));
+    const doc = await col.accessTokens.doc(token).get();
+    if (!doc.exists) {
+      await logAudit({ event: "invalid_access_token", eventCategory: "auth", success: false, ipAddress: req.ip });
+      return res.status(401).json(FHIR.operationOutcome("error", "security", "Invalid access token"));
     }
 
-    const facility = facilityDoc.data();
-    const endpoint = facility.fhirEndpoints.patient.replace(':id', nupi);
-    const url = `${facility.apiUrl}${endpoint}`;
+    const data = doc.data();
+    if (data.expiresAt.toDate() < new Date())
+      return res.status(401).json(FHIR.operationOutcome("error", "security", "Access token expired"));
+    if (data.useCount >= data.maxUses)
+      return res.status(429).json(FHIR.operationOutcome("error", "throttled", "Token usage limit reached"));
 
-    console.log(`🔄 Fetching FHIR Patient from ${facility.name}: ${nupi}`);
+    await col.accessTokens.doc(token).update({
+      useCount:   admin.firestore.FieldValue.increment(1),
+      lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
+    req.accessToken = data;
+    next();
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
+}
+
+//  SHARED HELPER — Issue access token after successful verification
+
+async function issueAccessToken(nupi, requestingFacility, method) {
+  const consentResult = await chain.grantConsent({
+    nupi, facilityId: requestingFacility,
+    consentType:  method === "security_question" ? "ID_VERIFIED" : "PIN_VERIFIED",
+    durationDays: 1,
+    notes:        `Verified by ${method} at ${new Date().toISOString()}`,
+    grantedBy:    requestingFacility,
+  });
+
+  const token = crypto.randomBytes(32).toString("hex");
+  await col.accessTokens.doc(token).set({
+    token, patientNupi: nupi, requestingFacility,
+    verificationMethod: method,
+    consentId:   consentResult.consentId,
+    blockIndex:  consentResult.block?.index,
+    scopes:      ["read:Patient", "read:Encounter", "read:Observation", "read:Condition", "read:Bundle", "write:Encounter"],
+    grantedAt:   admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt:   new Date(Date.now() + 24 * 60 * 60 * 1000),
+    useCount: 0, maxUses: 200,
+  });
+
+  return { token, nupi, consentId: consentResult.consentId, blockIndex: consentResult.block?.index, expiresIn: 86400 };
+}
+
+//  ROUTES — MoH Admin  /api/moh/*
+
+app.post("/api/moh/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (email !== (process.env.MOH_ADMIN_EMAIL || "admin@health.go.ke") ||
+      password !== process.env.MOH_ADMIN_PASSWORD)
+    return res.status(401).json({ error: "Invalid MoH credentials" });
+  await logAudit({ event: "moh_login", email, success: true, ipAddress: req.ip });
+  res.json({ success: true, token: signMohToken(email), role: "MOH_ADMIN" });
+});
+
+// Only MoH can register a facility — no self-registration allowed
+app.post("/api/moh/facilities/register", requireMoH, async (req, res) => {
+  try {
+    const { facilityId, name, mohLicense, type, county, apiUrl, fhirEndpoints, adminEmail, address } = req.body;
+    if (!facilityId || !name || !mohLicense || !apiUrl || !adminEmail)
+      return res.status(400).json({ error: "facilityId, name, mohLicense, apiUrl, adminEmail required" });
+
+    const existing = await col.facilities.doc(facilityId).get();
+    if (existing.exists) return res.status(409).json({ error: "Facility already registered" });
+
+    // Mint FACILITY_REGISTERED block
+    const chainResult = await chain.registerFacility({
+      facilityId, name, mohLicense,
+      type:      type   || "Hospital",
+      county:    county || "Unknown",
+      fhirUrl:   apiUrl,
+      adminEmail, approvedBy: req.moh.email,
+    });
+    if (!chainResult.success) return res.status(409).json(chainResult);
+
+    // HIE Firestore record
+    await col.facilities.doc(facilityId).set({
+      facilityId, name, mohLicense,
+      type:    type   || "Hospital",
+      county:  county || "Unknown",
+      apiUrl,
+      apiKeyHash: AfyaChain.sha256(chainResult.apiKey),
+      fhirVersion: "R4",
+      fhirEndpoints: {
+        patient:     "/fhir/Patient/:id",
+        encounter:   "/fhir/Encounter?patient=:id",
+        observation: "/fhir/Observation?patient=:id",
+        condition:   "/fhir/Condition?patient=:id",
+        bundle:      "/fhir/Patient/:id/$everything",
+        ...fhirEndpoints,
+      },
+      adminEmail, address: address || null,
+      active: true, verified: false,
+      blockIndex:   chainResult.block.index,
+      blockHash:    chainResult.block.hash,
+      registeredBy: req.moh.email,
+      registeredAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt:    admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await logAudit({ event: "facility_registered", facilityId, success: true, ipAddress: req.ip, metadata: { name, blockIndex: chainResult.block.index } });
+    console.log(`✅ Facility registered: ${name} | Block #${chainResult.block.index}`);
+
+    res.json({
+      success: true, facilityId,
+      apiKey:    chainResult.apiKey,  // ⚠ shown ONCE — facility saves this in their .env
+      blockIndex: chainResult.block.index,
+      blockHash:  chainResult.block.hash,
+      message:   `${name} registered. Save the API key — it will not be shown again.`,
+      usage:     "Set X-Facility-Id and X-Api-Key headers on all requests to the gateway",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/moh/facilities/:id/suspend", requireMoH, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ error: "reason required" });
+    const result = await chain.suspendFacility(req.params.id, reason, req.moh.email);
+    if (!result.success) return res.status(404).json(result);
+    await col.facilities.doc(req.params.id).update({ active: false, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    await logAudit({ event: "facility_suspended", facilityId: req.params.id, success: true, ipAddress: req.ip });
+    res.json({ success: true, blockIndex: result.block.index });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+app.post("/api/moh/facilities/:id/reactivate", requireMoH, async (req, res) => {
+  try {
+    const result = await chain.reactivateFacility(req.params.id, req.moh.email);
+    if (!result.success) return res.status(404).json(result);
+    await col.facilities.doc(req.params.id).update({ active: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    res.json({ success: true, blockIndex: result.block.index });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+app.get("/api/moh/facilities", requireMoH, async (req, res) => {
+  try {
+    const snap = await col.facilities.get();
+    const facilities = snap.docs.map(d => {
+      const data = d.data();
+      return { ...data, chainStatus: chain.getFacility(data.facilityId)?.status || "NOT_ON_CHAIN", registeredAt: data.registeredAt?.toDate?.() || data.registeredAt };
+    });
+    res.json({ success: true, facilities, count: facilities.length, chainStats: chain.getStats() });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+app.post("/api/moh/staff/credential", requireMoH, async (req, res) => {
+  try {
+    const { staffId, facilityId, name, role } = req.body;
+    if (!staffId || !facilityId || !name || !role)
+      return res.status(400).json({ error: "staffId, facilityId, name, role required" });
+    const result = await chain.credentialStaff({ staffId, facilityId, name, role, addedBy: req.moh.email });
+    res.json({ success: true, blockIndex: result.block.index });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+app.get("/api/moh/chain/stats",       requireMoH, (req, res) => res.json({ success: true, ...chain.getStats() }));
+app.get("/api/moh/chain/verify",      requireMoH, (req, res) => res.json(chain.verifyIntegrity()));
+app.get("/api/moh/chain/blocks",      requireMoH, (req, res) => res.json({ success: true, blocks: chain.recentBlocks(parseInt(req.query.limit) || 20) }));
+app.get("/api/moh/chain/audit/:nupi", requireMoH, (req, res) => res.json({ success: true, trail: chain.getAuditTrail(req.params.nupi) }));
+
+//  ROUTES — PUBLIC FACILITY LIST  (no auth — just active facilities)
+
+app.get("/api/facilities", async (req, res) => {
+  try {
+    const snap = await col.facilities.where("active", "==", true).get();
+    const facilities = snap.docs.map(d => {
+      const data = d.data();
+      return { facilityId: data.facilityId, name: data.name, county: data.county, type: data.type, active: data.active, verified: data.verified };
+    });
+    res.json({ success: true, facilities, count: facilities.length });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+//  ROUTES — PATIENT REGISTRATION  /api/patients/*
+//  Requires facility API key — only registered facilities can register patients
+
+app.post("/api/patients/register", requireFacility, async (req, res) => {
+  try {
+    const { nationalId, dob, name, securityQuestion, securityAnswer, pin } = req.body;
+    if (!nationalId || !dob || !name || !securityQuestion || !securityAnswer || !pin)
+      return res.status(400).json({ error: "nationalId, dob, name, securityQuestion, securityAnswer, pin required" });
+    if (pin.toString().length !== 4)
+      return res.status(400).json({ error: "PIN must be exactly 4 digits" });
+
+    const result = await chain.registerPatient({
+      nationalId, dob, name, securityQuestion, securityAnswer, pin,
+      facilityId: req.facilityId,
+    });
+
+    await logAudit({ event: "patient_registered", patientNupi: result.nupi, facilityId: req.facilityId, success: true, ipAddress: req.ip });
+
+    res.json({
+      success:       true,
+      nupi:          result.nupi,
+      alreadyExists: result.alreadyExists,
+      blockIndex:    result.block?.index,
+      message:       result.alreadyExists ? "Patient already on AfyaNet" : "Patient registered — block minted",
+    });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// Record an encounter — called by a facility after saving to their own FHIR server
+// This updates the blockchain index so other facilities know this patient was here
+app.post("/api/patients/encounter", requireFacility, async (req, res) => {
+  try {
+    const { nupi, encounterId, encounterType, encounterDate, chiefComplaint, practitionerName } = req.body;
+    if (!nupi || !encounterId)
+      return res.status(400).json({ error: "nupi and encounterId required" });
+
+    const result = await chain.recordEncounter({
+      nupi, facilityId: req.facilityId, encounterId,
+      encounterType:    encounterType    || "outpatient",
+      encounterDate:    encounterDate    || new Date().toISOString(),
+      chiefComplaint:   chiefComplaint   || null,
+      practitionerName: practitionerName || null,
+    });
+
+    if (!result.success) return res.status(400).json(result);
+
+    await logAudit({ event: "encounter_recorded", patientNupi: nupi, facilityId: req.facilityId, success: true, metadata: { encounterId, encounterType }, ipAddress: req.ip });
+
+    res.json({
+      success:    true,
+      encounterId,
+      blockIndex: result.blockIndex,
+      message:    `Encounter recorded on blockchain at ${req.facility.name}`,
+    });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+app.post("/api/patients/nupi", requireFacility, async (req, res) => {
+  const { nationalId, dob } = req.body;
+  if (!nationalId || !dob) return res.status(400).json({ error: "nationalId and dob required" });
+  res.json({ success: true, nupi: chain.generateNupi(nationalId, dob) });
+});
+
+app.get("/api/patients/:nupi/consents", requireFacility, (req, res) => {
+  res.json({ success: true, consents: chain.listConsents(req.params.nupi) });
+});
+
+// Get the patient's visit history from the blockchain — which facilities they've been to
+app.get("/api/patients/:nupi/history", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+    const patient  = chain.getPatient(nupi);
+    if (!patient) return res.status(404).json({ error: "Patient not on AfyaNet" });
+
+    const encounterIndex    = chain.getPatientEncounterIndex(nupi);
+    const facilitiesVisited = chain.getPatientFacilities(nupi);
+
+    // Enrich with facility names
+    const facilitiesDetail = facilitiesVisited.map(fid => {
+      const f = chain.getFacility(fid);
+      return { facilityId: fid, name: f?.name || "Unknown", county: f?.county, status: f?.status };
+    });
+
+    await logAudit({ event: "patient_history_accessed", patientNupi: nupi, facilityId: req.facilityId, success: true, ipAddress: req.ip });
+
+    res.json({
+      success: true,
+      nupi,
+      patient: { name: patient.name, registeredAt: patient.registeredAt, registeredAtFacility: patient.facilityId, lastSeenAt: patient.lastSeenAt, lastEncounterDate: patient.lastEncounterDate },
+      facilitiesVisited: facilitiesDetail,
+      encounterIndex,   // lightweight index: which encounters at which facilities
+      auditTrail: chain.getAuditTrail(nupi),
+    });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+//  ROUTES — IDENTITY VERIFICATION  /api/verify/*
+//  No facility key needed here — this is the patient-facing flow
+
+// Step 1 — get the security question
+app.post("/api/verify/question", async (req, res) => {
+  try {
+    const { nationalId, dob } = req.body;
+    if (!nationalId || !dob) return res.status(400).json({ error: "nationalId and dob required" });
+
+    const result = chain.getSecurityQuestion(nationalId, dob);
+    if (!result.found)
+      return res.status(404).json({ success: false, error: "Patient not registered on AfyaNet" });
+
+    await logAudit({ event: "security_question_fetched", patientNupi: result.nupi, success: true, ipAddress: req.ip });
+    res.json({ success: true, nupi: result.nupi, question: result.question });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// Step 2a — answer the security question → get token + full patient history
+app.post("/api/verify/answer", async (req, res) => {
+  try {
+    const { nationalId, dob, answer, requestingFacility } = req.body;
+    if (!nationalId || !dob || !answer || !requestingFacility)
+      return res.status(400).json({ error: "nationalId, dob, answer, requestingFacility required" });
+
+    // Validate requesting facility is on the network
+    const facCheck = await chain.verifyFacilityKey(
+      requestingFacility,
+      req.headers["x-api-key"] || ""
+    );
+    if (!facCheck.valid)
+      return res.status(403).json({ error: `Requesting facility not authorised: ${facCheck.reason}` });
+
+    const verification = await chain.verifyByAnswer(nationalId, dob, answer);
+    if (!verification.success) {
+      await logAudit({ event: "verification_failed", patientNupi: verification.nupi, facilityId: requestingFacility, success: false, ipAddress: req.ip });
+      return res.status(401).json(verification);
+    }
+
+    const tokenData = await issueAccessToken(verification.nupi, requestingFacility, "security_question");
+
+    // Return patient + their full blockchain history so the doctor at Facility B
+    // immediately sees that this patient was previously at Facility A
+    const encounterIndex    = chain.getPatientEncounterIndex(verification.nupi);
+    const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
+      const f = chain.getFacility(fid);
+      return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
+    });
+
+    await logAudit({ event: "patient_verified", patientNupi: verification.nupi, facilityId: requestingFacility, success: true, method: "security_question", ipAddress: req.ip });
+
+    res.json({
+      success: true,
+      ...tokenData,
+      patient: verification.patient,
+      facilitiesVisited,    // ← doctor at Hos B sees patient was at Hos A
+      encounterIndex,        // ← which encounters exist, at which facilities
+    });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// Step 2b — verify by PIN
+app.post("/api/verify/pin", async (req, res) => {
+  try {
+    const { nationalId, dob, pin, requestingFacility } = req.body;
+    if (!nationalId || !dob || !pin || !requestingFacility)
+      return res.status(400).json({ error: "nationalId, dob, pin, requestingFacility required" });
+
+    const facCheck = await chain.verifyFacilityKey(requestingFacility, req.headers["x-api-key"] || "");
+    if (!facCheck.valid)
+      return res.status(403).json({ error: `Requesting facility not authorised: ${facCheck.reason}` });
+
+    const verification = await chain.verifyByPin(nationalId, dob, pin);
+    if (!verification.success) return res.status(401).json(verification);
+
+    const tokenData      = await issueAccessToken(verification.nupi, requestingFacility, "pin");
+    const encounterIndex = chain.getPatientEncounterIndex(verification.nupi);
+    const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
+      const f = chain.getFacility(fid);
+      return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
+    });
+
+    res.json({ success: true, ...tokenData, patient: verification.patient, facilitiesVisited, encounterIndex });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+//  ROUTES — FHIR R4  /api/fhir/*
+//  Requires BOTH a valid facility API key AND a valid patient access token
+
+// Fetch a resource from a specific facility's FHIR server
+async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res) {
+  const facDoc = await col.facilities.doc(targetFacilityId).get();
+  if (!facDoc.exists || !facDoc.data().active)
+    return res.status(404).json(FHIR.operationOutcome("error", "not-found", `Facility ${targetFacilityId} not found or inactive`));
+
+  const facility    = facDoc.data();
+  const endpointKey = resourceType.toLowerCase();
+  const path        = facility.fhirEndpoints[endpointKey];
+  if (!path)
+    return res.status(404).json(FHIR.operationOutcome("error", "not-found", `Facility has no ${resourceType} endpoint`));
+
+  const url = `${facility.apiUrl}${path.replace(":id", nupi)}`;
+  console.log(`🔄 ${resourceType} → ${facility.name} (${targetFacilityId}): ${nupi}`);
+
+  try {
     const response = await axios.get(url, {
       timeout: 10000,
-      headers: {
-        'Accept': 'application/fhir+json',
-        'X-Gateway-ID': 'HIE_GATEWAY'
-      }
+      headers: { "Accept": "application/fhir+json", "X-Gateway-ID": "HIE_GATEWAY", "X-Requesting-Facility": req.facilityId },
     });
 
-    await logAudit({
-      event: 'fhir_patient_accessed',
-      eventCategory: 'data_access',
-      resource: 'Patient',
-      resourceId: nupi,
-      patientNupi: nupi,
-      facilityId,
-      action: 'read',
-      success: true,
-      ipAddress: req.ip
+    await chain.logAccess(nupi, "RECORD_ACCESSED", req.facilityId, {
+      resource: resourceType, sourceFacility: targetFacilityId, method: "fhir_get",
     });
+    await logAudit({ event: "fhir_accessed", patientNupi: nupi, facilityId: req.facilityId, sourceFacility: targetFacilityId, resource: resourceType, success: true, ipAddress: req.ip });
 
-    res.set('Content-Type', 'application/fhir+json');
+    res.set("Content-Type", "application/fhir+json");
     res.json(response.data);
-
-  } catch (error) {
-    console.error('FHIR fetch error:', error.message);
-    res.status(500).json(FHIR.operationOutcome('error', 'exception', error.message));
+  } catch (err) {
+    if (err.response?.status === 404)
+      return res.status(404).json(FHIR.operationOutcome("error", "not-found", `No ${resourceType} found for patient at ${facility.name}`));
+    throw err;
   }
+}
+
+// GET patient demographics from a facility
+app.get("/api/fhir/Patient/:nupi", requireFacility, requireAccessToken, async (req, res) => {
+  try {
+    const { nupi }   = req.params;
+    const facilityId = req.query.facility || req.facilityId;
+    await fetchFromFacility(nupi, "patient", facilityId, req, res);
+  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// GET FEDERATED FHIR BUNDLE ($everything)
-app.get('/api/fhir/Patient/:nupi/$everything', verifyAccessToken, async (req, res) => {
+// GET encounters from a specific facility
+app.get("/api/fhir/Patient/:nupi/Encounter", requireFacility, requireAccessToken, async (req, res) => {
+  try {
+    const facilityId = req.query.facility;
+    if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
+    await fetchFromFacility(req.params.nupi, "encounter", facilityId, req, res);
+  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+});
+
+// GET observations from a specific facility
+app.get("/api/fhir/Patient/:nupi/Observation", requireFacility, requireAccessToken, async (req, res) => {
+  try {
+    const facilityId = req.query.facility;
+    if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
+    await fetchFromFacility(req.params.nupi, "observation", facilityId, req, res);
+  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+});
+
+// GET conditions from a specific facility
+app.get("/api/fhir/Patient/:nupi/Condition", requireFacility, requireAccessToken, async (req, res) => {
+  try {
+    const facilityId = req.query.facility;
+    if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
+    await fetchFromFacility(req.params.nupi, "condition", facilityId, req, res);
+  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+});
+
+// GET everything from ALL facilities the patient has visited
+app.get("/api/fhir/Patient/:nupi/\\$everything", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi } = req.params;
+    console.log(`🌐 $everything for ${nupi} — requested by ${req.facilityId}`);
 
-    console.log(`🌐 Fetching federated FHIR Bundle for: ${nupi}`);
+    // Only query facilities the patient has actually visited (from blockchain index)
+    const visitedFacilityIds = chain.getPatientFacilities(nupi);
+    if (!visitedFacilityIds.length)
+      return res.json(FHIR.createBundle("collection", []));
 
-    const facilitiesSnapshot = await collections.facilities
-      .where('active', '==', true)
-      .get();
+    const facilities = (await Promise.all(
+      visitedFacilityIds.map(id => col.facilities.doc(id).get())
+    )).filter(d => d.exists && d.data().active).map(d => d.data());
 
-    const facilities = facilitiesSnapshot.docs.map(doc => doc.data());
-
-    // Fetch from all facilities
-    const facilityPromises = facilities.map(async (facility) => {
+    const results = await Promise.all(facilities.map(async (facility) => {
       try {
-        const endpoint = facility.fhirEndpoints.bundle?.replace(':id', nupi) ||
-                        facility.fhirEndpoints.encounter?.replace(':id', nupi);
-        const url = `${facility.apiUrl}${endpoint}`;
-
-        const response = await axios.get(url, {
+        const endpoint = facility.fhirEndpoints.bundle?.replace(":id", nupi) || facility.fhirEndpoints.encounter?.replace(":id", nupi);
+        const response = await axios.get(`${facility.apiUrl}${endpoint}`, {
           timeout: 10000,
-          headers: {
-            'Accept': 'application/fhir+json',
-            'X-Gateway-ID': 'HIE_GATEWAY'
-          }
+          headers: { "Accept": "application/fhir+json", "X-Gateway-ID": "HIE_GATEWAY", "X-Requesting-Facility": req.facilityId },
         });
-
-        return {
-          facilityId: facility.facilityId,
-          facilityName: facility.name,
-          data: response.data,
-          success: true
-        };
-      } catch (error) {
-        console.error(`Failed from ${facility.name}:`, error.message);
-        return {
-          facilityId: facility.facilityId,
-          facilityName: facility.name,
-          success: false
-        };
+        return { facilityId: facility.facilityId, facilityName: facility.name, data: response.data, success: true };
+      } catch {
+        return { facilityId: facility.facilityId, facilityName: facility.name, success: false };
       }
-    });
-
-    const results = await Promise.all(facilityPromises);
-
-    // Aggregate into FHIR Bundle
-    const allResources = [];
-
-    results.forEach(result => {
-      if (result.success && result.data) {
-        if (result.data.resourceType === 'Bundle' && result.data.entry) {
-          result.data.entry.forEach(entry => {
-            if (entry.resource) {
-              entry.resource.meta = entry.resource.meta || {};
-              entry.resource.meta.source = result.facilityId;
-              allResources.push(entry.resource);
-            }
-          });
-        } else if (result.data.resourceType) {
-          result.data.meta = result.data.meta || {};
-          result.data.meta.source = result.facilityId;
-          allResources.push(result.data);
-        }
-      }
-    });
-
-    const bundle = FHIR.createBundle('collection', allResources);
-
-    await logAudit({
-      event: 'federated_fhir_accessed',
-      eventCategory: 'data_access',
-      resource: 'Bundle',
-      resourceId: nupi,
-      patientNupi: nupi,
-      facilityId: req.accessToken.requestingFacility,
-      action: 'read',
-      success: true,
-      metadata: {
-        facilitiesQueried: facilities.length,
-        facilitiesSuccess: results.filter(r => r.success).length,
-        totalResources: allResources.length
-      },
-      ipAddress: req.ip
-    });
-
-    console.log(`✅ FHIR Bundle: ${allResources.length} resources from ${results.filter(r => r.success).length} facilities`);
-
-    res.set('Content-Type', 'application/fhir+json');
-    res.json(bundle);
-
-  } catch (error) {
-    await logAudit({
-      event: 'federated_fhir_error',
-      eventCategory: 'data_access',
-      success: false,
-      errorMessage: error.message,
-      ipAddress: req.ip
-    });
-
-    res.status(500).json(FHIR.operationOutcome('error', 'exception', error.message));
-  }
-});
-
-// GET AUDIT LOGS
-app.get('/api/audit', async (req, res) => {
-  try {
-    const { limit = 100, event, patientNupi } = req.query;
-
-    let query = collections.auditLog
-      .orderBy('timestamp', 'desc')
-      .limit(parseInt(limit));
-
-    if (event) {
-      query = query.where('event', '==', event);
-    }
-
-    if (patientNupi) {
-      query = query.where('patientNupi', '==', patientNupi);
-    }
-
-    const snapshot = await query.get();
-
-    const logs = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-      timestamp: doc.data().timestamp?.toDate()
     }));
 
-    res.json({
-      success: true,
-      logs,
-      count: logs.length
+    const allResources = [];
+    results.forEach(r => {
+      if (!r.success || !r.data) return;
+      const items = r.data.resourceType === "Bundle" ? r.data.entry?.map(e => e.resource).filter(Boolean) : [r.data];
+      items?.forEach(resource => {
+        resource.meta = { ...(resource.meta || {}), source: r.facilityId, sourceName: r.facilityName };
+        allResources.push(resource);
+      });
     });
 
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+    await chain.logAccess(nupi, "RECORD_ACCESSED", req.facilityId, {
+      resource: "Bundle", method: "fhir_everything",
+      facilitiesQueried: facilities.length,
+      facilitiesSuccess: results.filter(r => r.success).length,
+    });
+    await logAudit({ event: "federated_fhir_accessed", patientNupi: nupi, facilityId: req.facilityId, success: true, metadata: { facilitiesQueried: facilities.length, totalResources: allResources.length }, ipAddress: req.ip });
+
+    console.log(`✅ $everything: ${allResources.length} resources from ${results.filter(r => r.success).length}/${facilities.length} facilities`);
+    res.set("Content-Type", "application/fhir+json");
+    res.json(FHIR.createBundle("collection", allResources));
+  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// HEALTH CHECK
-app.get('/health', async (req, res) => {
+//  ROUTES — REFERRALS  /api/referrals
+
+app.post("/api/referrals", requireFacility, async (req, res) => {
   try {
-    await db.collection('_health_check').doc('test').set({
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    const facilitiesCount = (await collections.facilities.where('active', '==', true).get()).size;
-    const activeOTPs = (await collections.otpRequests.where('status', '==', 'pending').get()).size;
-
-    res.json({
-      status: 'ok',
-      uptime: process.uptime(),
-      database: 'Firebase Firestore',
-      databaseStatus: 'connected',
-      fhirVersion: 'R4',
-      fhirCompliant: true,
-      facilitiesCount,
-      activeOTPs,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      error: error.message
-    });
-  }
+    const { nupi, toFacility, reason, urgency, issuedBy } = req.body;
+    if (!nupi || !toFacility || !reason)
+      return res.status(400).json({ error: "nupi, toFacility, reason required" });
+    res.json(await chain.logReferral({ nupi, fromFacility: req.facilityId, toFacility, reason, urgency: urgency || "ROUTINE", issuedBy }));
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// START SERVER
+//  ROUTES — AUDIT  /api/audit
+
+app.get("/api/audit", requireFacility, async (req, res) => {
+  try {
+    const { limit = 100, event, patientNupi } = req.query;
+    let query = col.auditLog.orderBy("timestamp", "desc").limit(parseInt(limit));
+    if (event)       query = query.where("event",       "==", event);
+    if (patientNupi) query = query.where("patientNupi", "==", patientNupi);
+    const snap = await query.get();
+    res.json({ success: true, logs: snap.docs.map(d => ({ id: d.id, ...d.data(), timestamp: d.data().timestamp?.toDate() })), count: snap.size });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+//  HEALTH CHECK
+
+app.get("/health", async (req, res) => {
+  try {
+    await db.collection("_health").doc("ping").set({ ts: admin.firestore.FieldValue.serverTimestamp() });
+    const facilitiesCount = (await col.facilities.where("active", "==", true).get()).size;
+    const stats = chain.getStats();
+    res.json({
+      status: "ok", uptime: process.uptime(),
+      database: "Firebase Firestore", fhirVersion: "R4",
+      blockchain: { blocks: stats.totalBlocks, facilities: stats.activeFacilities, patients: stats.patients, encounters: stats.encounters, integrity: chain.verifyIntegrity().valid ? "✅ valid" : "❌ BROKEN" },
+      hie: { facilitiesCount },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ status: "error", error: err.message }); }
+});
+
+//  START
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`PRODUCTION HIE GATEWAY running on http://localhost:${PORT}`);
+  console.log(`\n🏥 AfyaLink HIE Gateway + Blockchain v4`);
+  console.log(`   http://localhost:${PORT}`);
+  console.log(`\n   MoH login:            POST /api/moh/login`);
+  console.log(`   Register facility:    POST /api/moh/facilities/register  (MoH token)`);
+  console.log(`   Register patient:     POST /api/patients/register        (X-Facility-Id + X-Api-Key)`);
+  console.log(`   Record encounter:     POST /api/patients/encounter        (X-Facility-Id + X-Api-Key)`);
+  console.log(`   Get question:         POST /api/verify/question`);
+  console.log(`   Verify + get token:   POST /api/verify/answer             (X-Facility-Id + X-Api-Key)`);
+  console.log(`   Patient history:      GET  /api/patients/:nupi/history    (X-Facility-Id + X-Api-Key)`);
+  console.log(`   Federated records:    GET  /api/fhir/Patient/:nupi/\$everything\n`);
 });
