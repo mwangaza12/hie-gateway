@@ -778,15 +778,14 @@ app.post("/api/verify/question", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-app.post("/api/verify/answer", async (req, res) => {
+app.post("/api/verify/answer", requireFacility, async (req, res) => {
   try {
-    const { nationalId, dob, answer, requestingFacility } = req.body;
-    if (!nationalId || !dob || !answer || !requestingFacility)
-      return res.status(400).json({ error: "nationalId, dob, answer, requestingFacility required" });
+    const { nationalId, dob, answer } = req.body;
+    if (!nationalId || !dob || !answer)
+      return res.status(400).json({ error: "nationalId, dob and answer required" });
 
-    const facCheck = await chain.verifyFacilityKey(requestingFacility, req.headers["x-api-key"] || "");
-    if (!facCheck.valid)
-      return res.status(403).json({ error: `Requesting facility not authorised: ${facCheck.reason}` });
+    // Facility already verified by requireFacility middleware
+    const requestingFacility = req.facilityId;
 
     const verification = await chain.verifyByAnswer(nationalId, dob, answer);
     if (!verification.success) {
@@ -808,15 +807,14 @@ app.post("/api/verify/answer", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-app.post("/api/verify/pin", async (req, res) => {
+app.post("/api/verify/pin", requireFacility, async (req, res) => {
   try {
-    const { nationalId, dob, pin, requestingFacility } = req.body;
-    if (!nationalId || !dob || !pin || !requestingFacility)
-      return res.status(400).json({ error: "nationalId, dob, pin, requestingFacility required" });
+    const { nationalId, dob, pin } = req.body;
+    if (!nationalId || !dob || !pin)
+      return res.status(400).json({ error: "nationalId, dob and pin required" });
 
-    const facCheck = await chain.verifyFacilityKey(requestingFacility, req.headers["x-api-key"] || "");
-    if (!facCheck.valid)
-      return res.status(403).json({ error: `Requesting facility not authorised: ${facCheck.reason}` });
+    // Facility already verified by requireFacility middleware
+    const requestingFacility = req.facilityId;
 
     const verification = await chain.verifyByPin(nationalId, dob, pin);
     if (!verification.success) return res.status(401).json(verification);
