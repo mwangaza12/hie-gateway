@@ -190,6 +190,13 @@ class AfyaChain {
 
   async verifyFacilityKey(facilityId, apiKey) {
     await this.ready();
+    console.log("🔑 verifyFacilityKey called:");
+    console.log("   facilityId:", JSON.stringify(facilityId));
+    console.log("   apiKey:", JSON.stringify(apiKey));
+    console.log("   apiKey hash:", AfyaChain.sha256(apiKey));
+    console.log("   stored hash:", this.facilities[facilityId]?.keyHash);
+    console.log("   match:", AfyaChain.sha256(apiKey) === this.facilities[facilityId]?.keyHash);
+    
     const fac = this.facilities[facilityId];
     if (!fac)                     return { valid: false, reason: "Facility not registered on AfyaNet" };
     if (fac.status !== "ACTIVE")  return { valid: false, reason: `Facility is ${fac.status}` };
