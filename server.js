@@ -971,6 +971,28 @@ app.get("/api/audit", requireFacility, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
+//  DEBUG — remove after fixing
+
+app.get("/api/debug/chain", async (req, res) => {
+  try {
+    const firestoreSnap = await db.collection("hie_chain").doc("facilities").collection("docs").get();
+    const firestoreFacs = {};
+    firestoreSnap.docs.forEach(d => { firestoreFacs[d.id] = d.data(); });
+
+    res.json({
+      inMemory:        Object.keys(chain.facilities),
+      inMemoryData:    chain.facilities,
+      inFirestore:     Object.keys(firestoreFacs),
+      inFirestoreData: firestoreFacs,
+      chainReady:      chain._ready,
+      chainBlocks:     chain.chain.length,
+      mismatch:        Object.keys(firestoreFacs).filter(id => !chain.facilities[id]),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 //  HEALTH CHECK
 
 app.get("/health", async (req, res) => {
