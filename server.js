@@ -1,44 +1,5 @@
 /**
  * AfyaLink Kenya — HIE Gateway + Blockchain  v4
- * ═══════════════════════════════════════════════
- *
- * ARCHITECTURE
- *
- *  Ministry of Health (MoH)
- *    - Only entity that can register facilities onto the network
- *    - Each facility gets a one-time API key (stored as hash on blockchain)
- *    - Can suspend / reactivate facilities
- *    - Has full visibility of the chain
- *
- *  Facility authentication (how Hos A knows it's really Hos B querying)
- *    - Every inter-facility request must carry X-Facility-Id + X-Api-Key headers
- *    - Gateway verifies the API key hash against the blockchain record
- *    - If key doesn't match → 401, request blocked, attempt logged on chain
- *    - Hospital A's FHIR server is NEVER called directly by Hospital B
- *      All queries go through the gateway which acts as the trusted broker
- *
- *  Patient journey
- *    1. Patient visits Hos A → registered (PATIENT_REGISTERED block minted)
- *    2. Hos A records encounters → ENCOUNTER_RECORDED block at Hos A
- *    3. Patient visits Hos B → doctor submits nationalId + security answer
- *       Gateway verifies identity, returns full history from Hos A
- *       IDENTITY_VERIFIED + RECORD_ACCESSED blocks minted
- *    4. Hos B records new encounters → ENCOUNTER_RECORDED block at Hos B
- *    5. Chain now shows patient was at A then B — full immutable trail
- *
- *  Firestore layout
- * 
- *   facilities/                      HIE operational record
- *   access_tokens/                   Post-verification bearer tokens
- *   audit_log/                       Operational audit events
- *
- *   afyachain/meta                   { chain: [...all blocks] }
- *   afyachain/facilities/docs/{id}   Blockchain facility record
- *   afyachain/patients/docs/{nupi}   Patient registry
- *   afyachain/consents/docs/{nupi}   { list: [...consents] }
- *   afyachain/identities/docs/{nupi} Hashed answer + PIN
- *   afyachain/staff/docs/{staffId}   Credentialed staff
- *   afyachain/encounters/docs/{id}   Encounter index (for cross-facility query)
  */
 
 import express   from "express";
@@ -47,7 +8,6 @@ import cors      from "cors";
 import helmet    from "helmet";
 import crypto    from "crypto";
 import admin     from "firebase-admin";
-import rateLimit from "express-rate-limit";
 import jwt       from "jsonwebtoken";
 import "dotenv/config";
 
@@ -106,7 +66,7 @@ class AfyaChain {
     this.consents   = {};
     this.identities = {};
     this.staff      = {};
-    this.encounters = {}; // encounterId → { nupi, facilityId, date, type }
+    this.encounters = {};
     this._ready       = false;
     this._initPromise = this._init();
   }
@@ -153,8 +113,6 @@ class AfyaChain {
     await batch.commit();
   }
 
-  // Crypto
-
   static sha256(data) {
     return crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
   }
@@ -166,8 +124,6 @@ class AfyaChain {
       `${nationalId.toUpperCase().trim()}|${dob}|AFYALINK_KENYA_2025`
     ).substring(0, 40).toUpperCase();
   }
-
-  // Blocks
 
   get _last() { return this.chain[this.chain.length - 1]; }
 
@@ -193,8 +149,6 @@ class AfyaChain {
     this.chain.push(b);
     return b;
   }
-
-  // Facility registry (MoH only)─
 
   async registerFacility({ facilityId, name, mohLicense, type, county, fhirUrl, adminEmail, approvedBy }) {
     await this.ready();
@@ -234,14 +188,6 @@ class AfyaChain {
     return { success: true, block };
   }
 
-  // Facility API key verification─
-  //
-  // This is the core trust mechanism.
-  // When Facility B wants to query the gateway:
-  //   - It sends X-Facility-Id: NBI-001 and X-Api-Key: FAC-XXXXX
-  //   - Gateway hashes the key and compares to keyHash stored on blockchain
-  //   - Match → legitimate facility. No match → blocked + logged.
-
   async verifyFacilityKey(facilityId, apiKey) {
     await this.ready();
     const fac = this.facilities[facilityId];
@@ -254,8 +200,6 @@ class AfyaChain {
   getFacility(facilityId) { return this.facilities[facilityId] || null; }
   listFacilities()        { return Object.values(this.facilities); }
 
-  // Staff─
-
   async credentialStaff({ staffId, facilityId, name, role, addedBy }) {
     await this.ready();
     const block = await this._append("STAFF_CREDENTIALED", { staffId, facilityId, name, role, addedBy });
@@ -263,8 +207,6 @@ class AfyaChain {
     await this._persist({ staffId });
     return { success: true, block };
   }
-
-  // Patient registry
 
   async registerPatient({ nationalId, dob, name, securityQuestion, securityAnswer, pin, facilityId }) {
     await this.ready();
@@ -288,12 +230,11 @@ class AfyaChain {
 
     this.patients[nupi] = {
       nupi, name, facilityId,
-      facilitiesVisited: [facilityId],   // track every facility this patient has been to
+      facilitiesVisited: [facilityId],
       registeredAt: block.timestamp,
       blockIndex:   block.index,
     };
 
-    // Default network consent
     if (!this.consents[nupi]) this.consents[nupi] = [];
     this.consents[nupi].push({
       consentId:   "NETCON-" + nupi.slice(5, 21),
@@ -311,13 +252,6 @@ class AfyaChain {
   generateNupi(nationalId, dob) { return AfyaChain.genNupi(nationalId, dob); }
   getPatient(nupi)               { return this.patients[nupi] || null; }
 
-  // Encounter recording─
-  //
-  // Called by a facility after recording an encounter in their own system.
-  // The blockchain stores a lightweight index — not the full clinical data
-  // (that stays on the facility's FHIR server). The index lets any authorised
-  // facility ask "which facilities have encounters for this patient?"
-
   async recordEncounter({ nupi, facilityId, encounterId, encounterType, encounterDate, chiefComplaint, practitionerName }) {
     await this.ready();
     if (!this.patients[nupi]) return { success: false, error: "Patient not on AfyaNet" };
@@ -329,38 +263,32 @@ class AfyaChain {
       practitionerName: practitionerName || null,
     });
 
-    // Store lightweight index
     this.encounters[encounterId] = {
       encounterId, nupi, facilityId, encounterType,
       encounterDate: encounterDate || block.timestamp,
       blockIndex: block.index,
     };
 
-    // Track which facilities this patient has visited
     const patient = this.patients[nupi];
     if (!patient.facilitiesVisited.includes(facilityId)) {
       patient.facilitiesVisited.push(facilityId);
     }
-    patient.lastSeenAt       = facilityId;
+    patient.lastSeenAt        = facilityId;
     patient.lastEncounterDate = block.timestamp;
 
     await this._persist({ patient: nupi, encounterId });
     return { success: true, encounterId, blockIndex: block.index, block };
   }
 
-  // Get all facilities a patient has visited (from blockchain index)
   getPatientFacilities(nupi) {
     const patient = this.patients[nupi];
     if (!patient) return [];
     return patient.facilitiesVisited || [];
   }
 
-  // Get encounter index for a patient (which encounters, at which facilities)
   getPatientEncounterIndex(nupi) {
     return Object.values(this.encounters).filter(e => e.nupi === nupi);
   }
-
-  // Consent─
 
   async grantConsent({ nupi, facilityId, consentType, durationDays, notes, grantedBy }) {
     await this.ready();
@@ -392,8 +320,6 @@ class AfyaChain {
   }
 
   listConsents(nupi) { return this.consents[nupi] || []; }
-
-  // Identity verification─
 
   getSecurityQuestion(nationalId, dob) {
     const nupi = AfyaChain.genNupi(nationalId, dob);
@@ -437,8 +363,6 @@ class AfyaChain {
     return { success: true, nupi, patient: this.patients[nupi] };
   }
 
-  // Referral
-
   async logReferral({ nupi, fromFacility, toFacility, reason, urgency, issuedBy }) {
     await this.ready();
     const referralId = "REF-" + AfyaChain.sha256(nupi + Date.now()).slice(0, 16).toUpperCase();
@@ -453,8 +377,6 @@ class AfyaChain {
     await this._persist();
     return block;
   }
-
-  // Audit / stats─
 
   getAuditTrail(nupi) { return this.chain.filter(b => b.data?.nupi === nupi); }
 
@@ -487,15 +409,9 @@ class AfyaChain {
 
 const chain = new AfyaChain();
 
-//  RATE LIMITING
-
-const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: "Too many requests" });
-const verifyLimiter  = rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  message: "Too many verification attempts" });
-const mohLimiter     = rateLimit({ windowMs: 15 * 60 * 1000, max: 30,  message: "Too many MoH requests" });
-
-app.use("/api/",        generalLimiter);
-app.use("/api/verify/", verifyLimiter);
-app.use("/api/moh/",    mohLimiter);
+// ── Rate limiting REMOVED ─────────────────────────────────────────
+// Removed generalLimiter, verifyLimiter, mohLimiter
+// No rate limiting on any routes
 
 //  AUDIT LOGGING
 
@@ -547,13 +463,6 @@ function requireMoH(req, res, next) {
 }
 
 //  MIDDLEWARE — Facility API key
-//
-//  Every inter-facility request must include:
-//    X-Facility-Id: NBI-001
-//    X-Api-Key:     FAC-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-//
-//  The gateway hashes the key and compares to the blockchain record.
-//  This is how Hospital A knows it's really Hospital B — not a random server.
 
 async function requireFacility(req, res, next) {
   const facilityId = req.headers["x-facility-id"];
@@ -565,22 +474,19 @@ async function requireFacility(req, res, next) {
   const check = await chain.verifyFacilityKey(facilityId, apiKey);
 
   if (!check.valid) {
-    // Log the failed attempt on the blockchain — immutable record of intrusion attempts
     await chain.logAccess("SYSTEM", "UNAUTHORIZED_ACCESS_ATTEMPT", facilityId, {
-      reason: check.reason,
-      ip: req.ip,
-      path: req.path,
+      reason: check.reason, ip: req.ip, path: req.path,
     });
     await logAudit({ event: "unauthorized_facility_attempt", facilityId, reason: check.reason, ipAddress: req.ip, success: false });
     return res.status(401).json({ error: check.reason });
   }
 
-  req.facility = check.facility;
+  req.facility   = check.facility;
   req.facilityId = facilityId;
   next();
 }
 
-//  MIDDLEWARE — Patient access token (post-verification)
+//  MIDDLEWARE — Patient access token
 
 async function requireAccessToken(req, res, next) {
   try {
@@ -648,7 +554,6 @@ app.post("/api/moh/login", async (req, res) => {
   res.json({ success: true, token: signMohToken(email), role: "MOH_ADMIN" });
 });
 
-// Only MoH can register a facility — no self-registration allowed
 app.post("/api/moh/facilities/register", requireMoH, async (req, res) => {
   try {
     const { facilityId, name, mohLicense, type, county, apiUrl, fhirEndpoints, adminEmail, address } = req.body;
@@ -658,7 +563,6 @@ app.post("/api/moh/facilities/register", requireMoH, async (req, res) => {
     const existing = await col.facilities.doc(facilityId).get();
     if (existing.exists) return res.status(409).json({ error: "Facility already registered" });
 
-    // Mint FACILITY_REGISTERED block
     const chainResult = await chain.registerFacility({
       facilityId, name, mohLicense,
       type:      type   || "Hospital",
@@ -668,7 +572,6 @@ app.post("/api/moh/facilities/register", requireMoH, async (req, res) => {
     });
     if (!chainResult.success) return res.status(409).json(chainResult);
 
-    // HIE Firestore record
     await col.facilities.doc(facilityId).set({
       facilityId, name, mohLicense,
       type:    type   || "Hospital",
@@ -698,7 +601,7 @@ app.post("/api/moh/facilities/register", requireMoH, async (req, res) => {
 
     res.json({
       success: true, facilityId,
-      apiKey:    chainResult.apiKey,  // ⚠ shown ONCE — facility saves this in their .env
+      apiKey:    chainResult.apiKey,
       blockIndex: chainResult.block.index,
       blockHash:  chainResult.block.hash,
       message:   `${name} registered. Save the API key — it will not be shown again.`,
@@ -756,7 +659,7 @@ app.get("/api/moh/chain/verify",      requireMoH, (req, res) => res.json(chain.v
 app.get("/api/moh/chain/blocks",      requireMoH, (req, res) => res.json({ success: true, blocks: chain.recentBlocks(parseInt(req.query.limit) || 20) }));
 app.get("/api/moh/chain/audit/:nupi", requireMoH, (req, res) => res.json({ success: true, trail: chain.getAuditTrail(req.params.nupi) }));
 
-//  ROUTES — PUBLIC FACILITY LIST  (no auth — just active facilities)
+//  ROUTES — PUBLIC FACILITY LIST
 
 app.get("/api/facilities", async (req, res) => {
   try {
@@ -769,8 +672,7 @@ app.get("/api/facilities", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-//  ROUTES — PATIENT REGISTRATION  /api/patients/*
-//  Requires facility API key — only registered facilities can register patients
+//  ROUTES — PATIENT REGISTRATION
 
 app.post("/api/patients/register", requireFacility, async (req, res) => {
   try {
@@ -797,8 +699,6 @@ app.post("/api/patients/register", requireFacility, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// Record an encounter — called by a facility after saving to their own FHIR server
-// This updates the blockchain index so other facilities know this patient was here
 app.post("/api/patients/encounter", requireFacility, async (req, res) => {
   try {
     const { nupi, encounterId, encounterType, encounterDate, chiefComplaint, practitionerName } = req.body;
@@ -836,7 +736,6 @@ app.get("/api/patients/:nupi/consents", requireFacility, (req, res) => {
   res.json({ success: true, consents: chain.listConsents(req.params.nupi) });
 });
 
-// Get the patient's visit history from the blockchain — which facilities they've been to
 app.get("/api/patients/:nupi/history", requireFacility, async (req, res) => {
   try {
     const { nupi } = req.params;
@@ -846,7 +745,6 @@ app.get("/api/patients/:nupi/history", requireFacility, async (req, res) => {
     const encounterIndex    = chain.getPatientEncounterIndex(nupi);
     const facilitiesVisited = chain.getPatientFacilities(nupi);
 
-    // Enrich with facility names
     const facilitiesDetail = facilitiesVisited.map(fid => {
       const f = chain.getFacility(fid);
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county, status: f?.status };
@@ -855,20 +753,17 @@ app.get("/api/patients/:nupi/history", requireFacility, async (req, res) => {
     await logAudit({ event: "patient_history_accessed", patientNupi: nupi, facilityId: req.facilityId, success: true, ipAddress: req.ip });
 
     res.json({
-      success: true,
-      nupi,
+      success: true, nupi,
       patient: { name: patient.name, registeredAt: patient.registeredAt, registeredAtFacility: patient.facilityId, lastSeenAt: patient.lastSeenAt, lastEncounterDate: patient.lastEncounterDate },
       facilitiesVisited: facilitiesDetail,
-      encounterIndex,   // lightweight index: which encounters at which facilities
+      encounterIndex,
       auditTrail: chain.getAuditTrail(nupi),
     });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-//  ROUTES — IDENTITY VERIFICATION  /api/verify/*
-//  No facility key needed here — this is the patient-facing flow
+//  ROUTES — IDENTITY VERIFICATION
 
-// Step 1 — get the security question
 app.post("/api/verify/question", async (req, res) => {
   try {
     const { nationalId, dob } = req.body;
@@ -883,18 +778,13 @@ app.post("/api/verify/question", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// Step 2a — answer the security question → get token + full patient history
 app.post("/api/verify/answer", async (req, res) => {
   try {
     const { nationalId, dob, answer, requestingFacility } = req.body;
     if (!nationalId || !dob || !answer || !requestingFacility)
       return res.status(400).json({ error: "nationalId, dob, answer, requestingFacility required" });
 
-    // Validate requesting facility is on the network
-    const facCheck = await chain.verifyFacilityKey(
-      requestingFacility,
-      req.headers["x-api-key"] || ""
-    );
+    const facCheck = await chain.verifyFacilityKey(requestingFacility, req.headers["x-api-key"] || "");
     if (!facCheck.valid)
       return res.status(403).json({ error: `Requesting facility not authorised: ${facCheck.reason}` });
 
@@ -906,8 +796,6 @@ app.post("/api/verify/answer", async (req, res) => {
 
     const tokenData = await issueAccessToken(verification.nupi, requestingFacility, "security_question");
 
-    // Return patient + their full blockchain history so the doctor at Facility B
-    // immediately sees that this patient was previously at Facility A
     const encounterIndex    = chain.getPatientEncounterIndex(verification.nupi);
     const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
       const f = chain.getFacility(fid);
@@ -916,17 +804,10 @@ app.post("/api/verify/answer", async (req, res) => {
 
     await logAudit({ event: "patient_verified", patientNupi: verification.nupi, facilityId: requestingFacility, success: true, method: "security_question", ipAddress: req.ip });
 
-    res.json({
-      success: true,
-      ...tokenData,
-      patient: verification.patient,
-      facilitiesVisited,    // ← doctor at Hos B sees patient was at Hos A
-      encounterIndex,        // ← which encounters exist, at which facilities
-    });
+    res.json({ success: true, ...tokenData, patient: verification.patient, facilitiesVisited, encounterIndex });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// Step 2b — verify by PIN
 app.post("/api/verify/pin", async (req, res) => {
   try {
     const { nationalId, dob, pin, requestingFacility } = req.body;
@@ -940,8 +821,8 @@ app.post("/api/verify/pin", async (req, res) => {
     const verification = await chain.verifyByPin(nationalId, dob, pin);
     if (!verification.success) return res.status(401).json(verification);
 
-    const tokenData      = await issueAccessToken(verification.nupi, requestingFacility, "pin");
-    const encounterIndex = chain.getPatientEncounterIndex(verification.nupi);
+    const tokenData         = await issueAccessToken(verification.nupi, requestingFacility, "pin");
+    const encounterIndex    = chain.getPatientEncounterIndex(verification.nupi);
     const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
       const f = chain.getFacility(fid);
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
@@ -951,10 +832,8 @@ app.post("/api/verify/pin", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-//  ROUTES — FHIR R4  /api/fhir/*
-//  Requires BOTH a valid facility API key AND a valid patient access token
+//  ROUTES — FHIR R4
 
-// Fetch a resource from a specific facility's FHIR server
 async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res) {
   const facDoc = await col.facilities.doc(targetFacilityId).get();
   if (!facDoc.exists || !facDoc.data().active)
@@ -989,7 +868,6 @@ async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res)
   }
 }
 
-// GET patient demographics from a facility
 app.get("/api/fhir/Patient/:nupi", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi }   = req.params;
@@ -998,7 +876,6 @@ app.get("/api/fhir/Patient/:nupi", requireFacility, requireAccessToken, async (r
   } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// GET encounters from a specific facility
 app.get("/api/fhir/Patient/:nupi/Encounter", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
@@ -1007,7 +884,6 @@ app.get("/api/fhir/Patient/:nupi/Encounter", requireFacility, requireAccessToken
   } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// GET observations from a specific facility
 app.get("/api/fhir/Patient/:nupi/Observation", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
@@ -1016,7 +892,6 @@ app.get("/api/fhir/Patient/:nupi/Observation", requireFacility, requireAccessTok
   } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// GET conditions from a specific facility
 app.get("/api/fhir/Patient/:nupi/Condition", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
@@ -1025,13 +900,11 @@ app.get("/api/fhir/Patient/:nupi/Condition", requireFacility, requireAccessToken
   } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-// GET everything from ALL facilities the patient has visited
 app.get("/api/fhir/Patient/:nupi/\\$everything", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi } = req.params;
     console.log(`🌐 $everything for ${nupi} — requested by ${req.facilityId}`);
 
-    // Only query facilities the patient has actually visited (from blockchain index)
     const visitedFacilityIds = chain.getPatientFacilities(nupi);
     if (!visitedFacilityIds.length)
       return res.json(FHIR.createBundle("collection", []));
@@ -1076,7 +949,7 @@ app.get("/api/fhir/Patient/:nupi/\\$everything", requireFacility, requireAccessT
   } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
 });
 
-//  ROUTES — REFERRALS  /api/referrals
+//  ROUTES — REFERRALS
 
 app.post("/api/referrals", requireFacility, async (req, res) => {
   try {
@@ -1087,7 +960,7 @@ app.post("/api/referrals", requireFacility, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-//  ROUTES — AUDIT  /api/audit
+//  ROUTES — AUDIT
 
 app.get("/api/audit", requireFacility, async (req, res) => {
   try {
@@ -1130,5 +1003,18 @@ app.listen(PORT, () => {
   console.log(`   Get question:         POST /api/verify/question`);
   console.log(`   Verify + get token:   POST /api/verify/answer             (X-Facility-Id + X-Api-Key)`);
   console.log(`   Patient history:      GET  /api/patients/:nupi/history    (X-Facility-Id + X-Api-Key)`);
-  console.log(`   Federated records:    GET  /api/fhir/Patient/:nupi/\$everything\n`);
+  console.log(`   Federated records:    GET  /api/fhir/Patient/:nupi/$everything\n`);
+
+  // ── Keep-alive — prevents Render free tier from sleeping ──────────
+  // Render spins down free services after 15 min of inactivity.
+  // Self-ping every 10 minutes keeps the server warm.
+  if (process.env.RENDER_EXTERNAL_URL) {
+    const pingUrl = `${process.env.RENDER_EXTERNAL_URL}/health`;
+    setInterval(() => {
+      axios.get(pingUrl, { timeout: 10000 })
+        .then(r => console.log(`🏓 Keep-alive ping → ${r.status}`))
+        .catch(e => console.warn(`⚠️  Keep-alive ping failed: ${e.message}`));
+    }, 10 * 60 * 1000); // every 10 minutes
+    console.log(`🏓 Keep-alive active → ${pingUrl}`);
+  }
 });
