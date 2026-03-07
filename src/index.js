@@ -18,7 +18,8 @@ import mohRoutes      from "./routes/moh.routes.js";
 import patientRoutes  from "./routes/patient.routes.js";
 import verifyRoutes   from "./routes/verify.routes.js";
 import fhirRoutes     from "./routes/fhir.routes.js";
-import referralRoutes from "./routes/referral.routes.js";
+import referralRoutes    from "./routes/referral.routes.js";
+import facilitiesRoutes from "./routes/facilities.routes.js";
 
 // ── Audit ─────────────────────────────────────────────────────────
 import { logAudit } from "./services/audit.js";
@@ -32,7 +33,8 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(",") || "*", credentia
 app.use(express.json({ limit: "10mb" }));
 
 // ── Mount routes ──────────────────────────────────────────────────
-app.use("/api/moh",       mohRoutes);
+app.use("/api/facilities", facilitiesRoutes);  // public — no auth needed
+app.use("/api/moh",        mohRoutes);
 app.use("/api/patients",  patientRoutes);
 app.use("/api/verify",    verifyRoutes);
 app.use("/api/fhir",      fhirRoutes);
