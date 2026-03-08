@@ -14,10 +14,11 @@ router.post("/register", requireFacility, async (req, res) => {
     if (!nationalId || !dob || !name || !securityQuestion || !securityAnswer || !pin)
       return res.status(400).json({ error: "nationalId, dob, name, securityQuestion, securityAnswer, pin required" });
 
-    // FIX 1: accept 4–6 digit PINs to match the Flutter registration form
+    // FIX: was 4–6 digits maximum — raised to 4–8 to match Flutter (maxLength=8)
+    //      and the SupportFacility web frontend (maxLength=8). 4 is still the minimum.
     const pinStr = pin.toString();
-    if (pinStr.length < 4 || pinStr.length > 6)
-      return res.status(400).json({ error: "PIN must be 4–6 digits" });
+    if (pinStr.length < 4 || pinStr.length > 8)
+      return res.status(400).json({ error: "PIN must be 4–8 digits" });
 
     const result = await chain.registerPatient({
       nationalId, dob, name,
@@ -92,9 +93,6 @@ router.post("/encounter", requireFacility, async (req, res) => {
 });
 
 // ─── POST /api/patients/token ─────────────────────────────────────────────────
-// FIX 3: issueAccessToken was imported but never wired to a route, causing
-// "invalid_access_token" audit events whenever the app tried to use a token
-// that was never issued. Verifies PIN + security answer then issues the token.
 router.post("/token", requireFacility, async (req, res) => {
   try {
     const { nupi, pin, securityAnswer } = req.body;
@@ -135,8 +133,6 @@ router.post("/token", requireFacility, async (req, res) => {
 });
 
 // ─── GET /api/patients/nupi ───────────────────────────────────────────────────
-// FIX 2: was POST with a body — changed to GET with query params since this
-// is a pure lookup with no side effects.
 router.get("/nupi", requireFacility, (req, res) => {
   const { nationalId, dob } = req.query;
   if (!nationalId || !dob)
@@ -146,8 +142,6 @@ router.get("/nupi", requireFacility, (req, res) => {
 });
 
 // ─── GET /api/patients/:nupi ──────────────────────────────────────────────────
-// FIX 4: missing simple patient lookup — PatientLookupPage needs this for
-// cross-facility NUPI search.
 router.get("/:nupi", requireFacility, async (req, res) => {
   try {
     const { nupi } = req.params;
