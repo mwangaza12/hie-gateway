@@ -37,56 +37,109 @@ async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res)
   }
 }
 
+// ─── GET /api/fhir/Patient/:nupi ──────────────────────────────────────────────
+// FIX: Always prefer ?facility query param (the patient's registered facility)
+//      over req.facilityId (the requesting facility). Without this, cross-
+//      facility patients always returned empty demographics because the gateway
+//      was querying the wrong facility's FHIR endpoint.
 router.get("/Patient/:nupi", requireFacility, requireAccessToken, async (req, res) => {
   try {
-    const { nupi }   = req.params;
+    const { nupi } = req.params;
+
+    // ✅ FIX: clients must pass ?facility=REGISTERED_FACILITY_ID after verification.
+    //        The verify/answer response includes registeredFacilityId for this purpose.
     const facilityId = req.query.facility || req.facilityId;
+
+    if (!req.query.facility) {
+      console.warn(
+        `⚠️  GET /fhir/Patient/${nupi} called without ?facility param. ` +
+        `Falling back to requesting facility ${req.facilityId}. ` +
+        `Demographics will be empty for cross-facility patients.`
+      );
+    }
+
     await fetchFromFacility(nupi, "patient", facilityId, req, res);
-  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
 });
 
+// ─── GET /api/fhir/Patient/:nupi/Encounter ────────────────────────────────────
 router.get("/Patient/:nupi/Encounter", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
     await fetchFromFacility(req.params.nupi, "encounter", facilityId, req, res);
-  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
 });
 
+// ─── GET /api/fhir/Patient/:nupi/Observation ──────────────────────────────────
 router.get("/Patient/:nupi/Observation", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
     await fetchFromFacility(req.params.nupi, "observation", facilityId, req, res);
-  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
 });
 
+// ─── GET /api/fhir/Patient/:nupi/Condition ────────────────────────────────────
 router.get("/Patient/:nupi/Condition", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
     await fetchFromFacility(req.params.nupi, "condition", facilityId, req, res);
-  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
 });
 
+// ─── GET /api/fhir/Patient/:nupi/$everything ──────────────────────────────────
+// FIX: Accept optional ?registeredFacility=ID so the patient's home facility
+//      is always queried, even if it hasn't yet appeared in the blockchain
+//      facility list (i.e. no encounter was ever blockchain-recorded there).
 router.get("/Patient/:nupi/\\$everything", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi } = req.params;
-    console.log(`🌐 $everything for ${nupi} — requested by ${req.facilityId}`);
+    const registeredFacilityId = req.query.registeredFacility || null;
 
-    const visitedFacilityIds = chain.getPatientFacilities(nupi);
-    if (!visitedFacilityIds.length) return res.json(FHIR.createBundle("collection", []));
+    console.log(`🌐 $everything for ${nupi} — requested by ${req.facilityId}, registeredFacility=${registeredFacilityId ?? 'not provided'}`);
+
+    const blockchainFacilityIds = chain.getPatientFacilities(nupi);
+
+    // ✅ FIX: always include the registered facility so its encounters show up
+    //        even when no blockchain encounter block has been minted there yet.
+    const allFacilityIds = registeredFacilityId
+      ? [...new Set([registeredFacilityId, ...blockchainFacilityIds])]
+      : blockchainFacilityIds;
+
+    if (!allFacilityIds.length) return res.json(FHIR.createBundle("collection", []));
 
     const facilities = (await Promise.all(
-      visitedFacilityIds.map(id => col.facilities.doc(id).get())
+      allFacilityIds.map(id => col.facilities.doc(id).get())
     )).filter(d => d.exists && d.data().active).map(d => d.data());
 
     const results = await Promise.all(facilities.map(async (facility) => {
       try {
-        const endpoint = facility.fhirEndpoints.bundle?.replace(":id", nupi) || facility.fhirEndpoints.encounter?.replace(":id", nupi);
+        const endpoint =
+          facility.fhirEndpoints.bundle?.replace(":id", nupi) ||
+          facility.fhirEndpoints.encounter?.replace(":id", nupi);
+
+        if (!endpoint) {
+          console.warn(`⚠️  Facility ${facility.facilityId} has no bundle/encounter endpoint`);
+          return { facilityId: facility.facilityId, facilityName: facility.name, success: false };
+        }
+
         const response = await axios.get(`${facility.apiUrl}${endpoint}`, {
           timeout: 10000,
-          headers: { "Accept": "application/fhir+json", "X-Gateway-ID": "HIE_GATEWAY", "X-Requesting-Facility": req.facilityId },
+          headers: {
+            "Accept": "application/fhir+json",
+            "X-Gateway-ID": "HIE_GATEWAY",
+            "X-Requesting-Facility": req.facilityId,
+          },
         });
         return { facilityId: facility.facilityId, facilityName: facility.name, data: response.data, success: true };
       } catch {
@@ -97,20 +150,32 @@ router.get("/Patient/:nupi/\\$everything", requireFacility, requireAccessToken, 
     const allResources = [];
     results.forEach(r => {
       if (!r.success || !r.data) return;
-      const items = r.data.resourceType === "Bundle" ? r.data.entry?.map(e => e.resource).filter(Boolean) : [r.data];
+      const items = r.data.resourceType === "Bundle"
+        ? r.data.entry?.map(e => e.resource).filter(Boolean)
+        : [r.data];
       items?.forEach(resource => {
         resource.meta = { ...(resource.meta || {}), source: r.facilityId, sourceName: r.facilityName };
         allResources.push(resource);
       });
     });
 
-    await chain.logAccess(nupi, "RECORD_ACCESSED", req.facilityId, { resource: "Bundle", method: "fhir_everything", facilitiesQueried: facilities.length, facilitiesSuccess: results.filter(r => r.success).length });
-    await logAudit({ event: "federated_fhir_accessed", patientNupi: nupi, facilityId: req.facilityId, success: true, metadata: { facilitiesQueried: facilities.length, totalResources: allResources.length }, ipAddress: req.ip });
+    await chain.logAccess(nupi, "RECORD_ACCESSED", req.facilityId, {
+      resource: "Bundle", method: "fhir_everything",
+      facilitiesQueried: facilities.length,
+      facilitiesSuccess: results.filter(r => r.success).length,
+    });
+    await logAudit({
+      event: "federated_fhir_accessed", patientNupi: nupi, facilityId: req.facilityId, success: true,
+      metadata: { facilitiesQueried: facilities.length, totalResources: allResources.length },
+      ipAddress: req.ip,
+    });
 
     console.log(`✅ $everything: ${allResources.length} resources from ${results.filter(r => r.success).length}/${facilities.length} facilities`);
     res.set("Content-Type", "application/fhir+json");
     res.json(FHIR.createBundle("collection", allResources));
-  } catch (err) { res.status(500).json(FHIR.operationOutcome("error", "exception", err.message)); }
+  } catch (err) {
+    res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
+  }
 });
 
 export default router;
