@@ -81,6 +81,10 @@ router.post("/answer", requireFacility, async (req, res) => {
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
     });
 
+    // Tell the caller which facility registered this patient so it knows
+    // which facility's FHIR endpoint to query for full demographics.
+    const regFac = chain.getFacility(verification.patient.facilityId);
+
     await logAudit({
       event:       "patient_verified",
       patientNupi: verification.nupi,
@@ -93,7 +97,14 @@ router.post("/answer", requireFacility, async (req, res) => {
     res.json({
       success: true,
       ...tokenData,
-      patient:          verification.patient,
+      patient: {
+        nupi:               verification.nupi,
+        name:               verification.patient.name,
+        registeredFacilityId: verification.patient.facilityId,
+        registeredFacility:   regFac?.name   || verification.patient.facilityId,
+        facilityCounty:       regFac?.county || '',
+        isCurrentFacility:    verification.patient.facilityId === req.facilityId,
+      },
       facilitiesVisited,
       encounterIndex,
     });
@@ -122,10 +133,19 @@ router.post("/pin", requireFacility, async (req, res) => {
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
     });
 
+    const regFac2 = chain.getFacility(verification.patient.facilityId);
+
     res.json({
       success: true,
       ...tokenData,
-      patient:          verification.patient,
+      patient: {
+        nupi:                 verification.nupi,
+        name:                 verification.patient.name,
+        registeredFacilityId: verification.patient.facilityId,
+        registeredFacility:   regFac2?.name   || verification.patient.facilityId,
+        facilityCounty:       regFac2?.county || '',
+        isCurrentFacility:    verification.patient.facilityId === req.facilityId,
+      },
       facilitiesVisited,
       encounterIndex,
     });
