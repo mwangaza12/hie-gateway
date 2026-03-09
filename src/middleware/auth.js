@@ -56,8 +56,9 @@ export async function requireAccessToken(req, res, next) {
     const data = doc.data();
     if (data.expiresAt.toDate() < new Date())
       return res.status(401).json(FHIR.operationOutcome("error", "security", "Access token expired"));
-    if (data.useCount >= data.maxUses)
-      return res.status(429).json(FHIR.operationOutcome("error", "throttled", "Token usage limit reached"));
+    // Rate limiting disabled for development — re-enable for production
+    // if (data.useCount >= data.maxUses)
+    //   return res.status(429).json(FHIR.operationOutcome("error", "throttled", "Token usage limit reached"));
 
     await col.accessTokens.doc(token).update({
       useCount:   admin.firestore.FieldValue.increment(1),

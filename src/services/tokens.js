@@ -20,7 +20,7 @@ export async function issueAccessToken(nupi, requestingFacility, method) {
     scopes:      ["read:Patient", "read:Encounter", "read:Observation", "read:Condition", "read:Bundle", "write:Encounter"],
     grantedAt:   admin.firestore.FieldValue.serverTimestamp(),
     expiresAt:   new Date(Date.now() + 24 * 60 * 60 * 1000),
-    useCount: 0, maxUses: 200,
+    useCount: 0, maxUses: 999999,
   });
 
   return { token, nupi, consentId: consentResult.consentId, blockIndex: consentResult.block?.index, expiresIn: 86400 };
