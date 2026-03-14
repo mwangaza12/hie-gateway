@@ -237,6 +237,66 @@ router.get("/facilities/:id/firebase-config", requireMoH, async (req, res) => {
   }
 });
 
+
+// ── POST /api/moh/facilities/:id/rotate-key ───────────────────────────────────
+//
+// Generates a new API key for a facility when the old one is lost or compromised.
+// The old key is immediately invalidated — any device still using it will get
+// 401 errors and will need to be reconfigured with the new key.
+//
+// This mints a FACILITY_KEY_ROTATED block on the blockchain for audit.
+// The new key is shown ONCE in the response — save it immediately.
+//
+router.post("/facilities/:id/rotate-key", requireMoH, async (req, res) => {
+  try {
+    const { id: facilityId } = req.params;
+    const { reason }         = req.body;
+
+    if (!reason)
+      return res.status(400).json({ error: "reason is required (for audit log)" });
+
+    const doc = await col.facilities.doc(facilityId).get();
+    if (!doc.exists)
+      return res.status(404).json({ error: "Facility not found" });
+
+    const result = await chain.rotateApiKey(facilityId, req.moh.email);
+    if (!result.success)
+      return res.status(400).json({ success: false, error: result.error });
+
+    // Update the apiKeyHash in Firestore with the new key's hash
+    await col.facilities.doc(facilityId).update({
+      apiKeyHash: result.block.data.newKeyHash,
+      updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await logAudit({
+      event:      "facility_key_rotated",
+      facilityId, success: true,
+      ipAddress:  req.ip,
+      metadata:   {
+        reason,
+        rotatedBy:  req.moh.email,
+        blockIndex: result.block.index,
+      },
+    });
+
+    console.log(`🔑 API key rotated: ${doc.data().name} | Block #${result.block.index}`);
+
+    res.json({
+      success:    true,
+      facilityId,
+      apiKey:     result.apiKey,   // ← NEW KEY — shown once, save immediately
+      blockIndex: result.block.index,
+      blockHash:  result.block.hash,
+      message:    `API key rotated for ${doc.data().name}. ` +
+                  "Save the new key — it will not be shown again. " +
+                  "Update the setup wizard on all facility devices with this new key.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── POST /api/moh/facilities/:id/suspend ─────────────────────────────────────
 router.post("/facilities/:id/suspend", requireMoH, async (req, res) => {
   try {

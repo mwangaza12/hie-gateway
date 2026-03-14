@@ -120,6 +120,34 @@ export class AfyaChain {
     return { success: true, block };
   }
 
+
+  async rotateApiKey(facilityId, rotatedBy) {
+    await this.ready();
+    const fac = this.facilities[facilityId];
+    if (!fac)                    return { success: false, error: 'Facility not found' };
+    if (fac.status !== 'ACTIVE') return { success: false, error: `Facility is ${fac.status} — reactivate before rotating key` };
+
+    // Generate a new API key the same way registration does
+    const newApiKey  = 'FAC-' + AfyaChain.sha256(facilityId + Date.now() + 'ROTATE').substring(0, 32).toUpperCase();
+    const newKeyHash = AfyaChain.sha256(newApiKey);
+
+    // Mint a block recording the rotation — old keyHash is preserved in
+    // the block for audit purposes but is no longer valid for auth
+    const block = await this._append('FACILITY_KEY_ROTATED', {
+      facilityId,
+      oldKeyHash:  fac.keyHash,   // audit trail only
+      newKeyHash,
+      rotatedBy,
+      rotatedAt:   new Date().toISOString(),
+    });
+
+    // Replace the active keyHash in memory and persist
+    this.facilities[facilityId].keyHash = newKeyHash;
+    await this._persist({ facility: facilityId });
+
+    return { success: true, facilityId, apiKey: newApiKey, block };
+  }
+
   async verifyFacilityKey(facilityId, apiKey) {
     await this.ready();
     console.log("🔑 verifyFacilityKey:", facilityId, "| match:", AfyaChain.sha256(apiKey) === this.facilities[facilityId]?.keyHash);
