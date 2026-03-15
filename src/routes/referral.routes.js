@@ -20,15 +20,18 @@ const router = Router();
 // Create a referral — logs on blockchain
 router.post("/", requireFacility, async (req, res) => {
   try {
-    const { nupi, toFacility, reason, urgency, issuedBy } = req.body;
+    const { nupi, toFacility, reason, urgency, issuedBy,
+            patientName, clinicalNotes } = req.body;
     if (!nupi || !toFacility || !reason)
       return res.status(400).json({ error: "nupi, toFacility, reason required" });
 
     const result = await chain.logReferral({
       nupi, fromFacility: req.facilityId,
       toFacility, reason,
-      urgency:  urgency  || "ROUTINE",
-      issuedBy: issuedBy || null,
+      urgency:       urgency       || "ROUTINE",
+      issuedBy:      issuedBy      || null,
+      patientName:   patientName   || null,
+      clinicalNotes: clinicalNotes || null,
     });
 
     await logAudit({ event: "referral_created", patientNupi: nupi, facilityId: req.facilityId, success: true, metadata: { toFacility, urgency, referralId: result.referralId }, ipAddress: req.ip });
@@ -132,6 +135,46 @@ router.get("/:referralId", requireFacility, async (req, res) => {
         createdAt:        block.timestamp,
       },
     });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// PATCH /api/referrals/:referralId/status
+// Lets receiving facility update status — logged on blockchain so sender sees it
+router.patch("/:referralId/status", requireFacility, async (req, res) => {
+  try {
+    const { referralId } = req.params;
+    const { status, notes } = req.body;
+
+    const validStatuses = ["pending", "accepted", "rejected", "completed", "cancelled"];
+    if (!status || !validStatuses.includes(status.toLowerCase()))
+      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+
+    // Verify referral exists and this facility is involved
+    const block = chain.chain.find(b =>
+      b.type === "REFERRAL_ISSUED" && b.data?.referralId === referralId);
+    if (!block)
+      return res.status(404).json({ success: false, error: "Referral not found on chain" });
+
+    if (block.data.fromFacility !== req.facilityId && block.data.toFacility !== req.facilityId)
+      return res.status(403).json({ success: false, error: "Access denied — not your referral" });
+
+    const result = await chain.updateReferralStatus({
+      referralId,
+      status:    status.toLowerCase(),
+      updatedBy: req.facilityId,
+      notes:     notes || null,
+    });
+
+    await logAudit({
+      event:       "referral_status_updated",
+      patientNupi: block.data.nupi,
+      facilityId:  req.facilityId,
+      success:     true,
+      metadata:    { referralId, status, fromFacility: block.data.fromFacility, toFacility: block.data.toFacility },
+      ipAddress:   req.ip,
+    });
+
+    res.json({ success: true, referralId, status, blockIndex: result.block.index });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 

@@ -11,9 +11,6 @@ router.post("/register", requireFacility, async (req, res) => {
   try {
     const {
       nationalId, dob, name, securityQuestion, securityAnswer, pin,
-      // FIX: accept full demographics so they are stored centrally on the chain.
-      // Without this, Facility B can only retrieve the patient's name — all other
-      // fields (phone, gender, county, etc.) were discarded at registration.
       gender, phoneNumber, email, county, subCounty, ward, village,
     } = req.body;
 
@@ -29,7 +26,6 @@ router.post("/register", requireFacility, async (req, res) => {
       securityQuestion, securityAnswer,
       pin:         pinStr,
       facilityId:  req.facilityId,
-      // demographics
       gender:      gender      || null,
       phoneNumber: phoneNumber || null,
       email:       email       || null,
@@ -228,6 +224,35 @@ router.get("/:nupi/history", requireFacility, async (req, res) => {
       encounterIndex,
       auditTrail: chain.getAuditTrail(nupi),
     });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── GET /api/patients/:nupi/encounters ──────────────────────────────────────
+// Returns the encounter index for a patient directly from the blockchain.
+// No FHIR proxy — works even when the registering facility is offline.
+// Facility B uses this to show encounter history on the lookup page.
+router.get("/:nupi/encounters", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+
+    const patient = chain.getPatient(nupi);
+    if (!patient)
+      return res.status(404).json({ error: "Patient not on AfyaNet" });
+
+    const encounters = chain.getPatientEncounterList(nupi);
+
+    await logAudit({
+      event:       "patient_encounter_index_accessed",
+      patientNupi: nupi,
+      facilityId:  req.facilityId,
+      success:     true,
+      metadata:    { count: encounters.length },
+      ipAddress:   req.ip,
+    });
+
+    res.json({ success: true, nupi, encounters, count: encounters.length });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

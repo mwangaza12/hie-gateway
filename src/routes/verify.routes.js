@@ -105,8 +105,6 @@ router.post("/answer", requireFacility, async (req, res) => {
         registeredFacility:   regFac?.name   || pd.facilityId,
         facilityCounty:       regFac?.county || '',
         isCurrentFacility:    pd.facilityId === req.facilityId,
-        // FIX: include demographics stored at registration time.
-        // Without this, Facility B receives only the patient's name.
         dob:         pd.dob         || '',
         gender:      pd.gender      || '',
         phoneNumber: pd.phoneNumber || '',
@@ -157,7 +155,6 @@ router.post("/pin", requireFacility, async (req, res) => {
         registeredFacility:   regFac2?.name   || pd2.facilityId,
         facilityCounty:       regFac2?.county || '',
         isCurrentFacility:    pd2.facilityId === req.facilityId,
-        // FIX: include demographics
         dob:         pd2.dob         || '',
         gender:      pd2.gender      || '',
         phoneNumber: pd2.phoneNumber || '',

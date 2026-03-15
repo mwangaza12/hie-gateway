@@ -195,8 +195,6 @@ export class AfyaChain {
       facilitiesVisited: [facilityId],
       registeredAt: block.timestamp,
       blockIndex:   block.index,
-      // FIX: store demographics so any facility can retrieve them
-      // without proxying back to the registering facility's FHIR server.
       dob:         dob         || null,
       gender:      gender      || null,
       phoneNumber: phoneNumber || null,
@@ -242,6 +240,19 @@ export class AfyaChain {
   }
 
   getPatientFacilities(nupi)     { return this.patients[nupi]?.facilitiesVisited || []; }
+  getPatientEncounterList(nupi)  {
+    return Object.values(this.encounters)
+      .filter(e => e.nupi === nupi)
+      .sort((a, b) => new Date(b.encounterDate) - new Date(a.encounterDate))
+      .map(e => ({
+        encounterId:   e.encounterId,
+        facilityId:    e.facilityId,
+        facilityName:  this.getFacility(e.facilityId)?.name || e.facilityId,
+        encounterType: e.encounterType,
+        encounterDate: e.encounterDate,
+        blockIndex:    e.blockIndex,
+      }));
+  }
   getPatientEncounterIndex(nupi) { return Object.values(this.encounters).filter(e => e.nupi === nupi); }
 
   // ── Consents ────────────────────────────────────────────────────
@@ -316,55 +327,73 @@ export class AfyaChain {
     await this._persist({ identity: nupi });
     const p = this.patients[nupi];
     return {
-      success: true,
-      nupi,
+      success: true, nupi,
       patient: {
-        // Core identity (always present)
-        nupi:        p.nupi,
-        name:        p.name,
-        facilityId:  p.facilityId,
-        registeredAt: p.registeredAt,
-        facilitiesVisited: p.facilitiesVisited,
-        // Full demographics (present if registered with the updated app)
-        dob:         p.dob         || null,
-        gender:      p.gender      || null,
-        phoneNumber: p.phoneNumber || null,
-        email:       p.email       || null,
-        county:      p.county      || null,
-        subCounty:   p.subCounty   || null,
-        ward:        p.ward        || null,
-        village:     p.village     || null,
+        nupi: p.nupi, name: p.name, facilityId: p.facilityId,
+        registeredAt: p.registeredAt, facilitiesVisited: p.facilitiesVisited,
+        dob: p.dob || null, gender: p.gender || null,
+        phoneNumber: p.phoneNumber || null, email: p.email || null,
+        county: p.county || null, subCounty: p.subCounty || null,
+        ward: p.ward || null, village: p.village || null,
       },
     };
   }
 
   // ── Referrals ───────────────────────────────────────────────────
 
-  async logReferral({ nupi, fromFacility, toFacility, reason, urgency, issuedBy }) {
+  async logReferral({ nupi, fromFacility, toFacility, reason, urgency, issuedBy,
+                      patientName, clinicalNotes }) {
     await this.ready();
     const referralId = "REF-" + AfyaChain.sha256(nupi + Date.now()).slice(0, 16).toUpperCase();
-    const block      = await this._append("REFERRAL_ISSUED", { referralId, nupi, fromFacility, toFacility, reason, urgency, issuedBy });
+    const block      = await this._append("REFERRAL_ISSUED", {
+      referralId, nupi, fromFacility, toFacility, reason, urgency, issuedBy,
+      patientName:   patientName   || null,
+      clinicalNotes: clinicalNotes || null,
+    });
     await this._persist();
     return { success: true, referralId, block };
+  }
+
+  async updateReferralStatus({ referralId, status, updatedBy, notes }) {
+    await this.ready();
+    const block = await this._append("REFERRAL_STATUS_UPDATED", {
+      referralId, status, updatedBy: updatedBy || null,
+      notes: notes || null, updatedAt: new Date().toISOString(),
+    });
+    await this._persist();
+    return { success: true, referralId, status, block };
+  }
+
+  _getReferralLatestStatus(referralId) {
+    const updates = this.chain
+      .filter(b => b.type === "REFERRAL_STATUS_UPDATED" && b.data?.referralId === referralId)
+      .sort((a, b) => b.index - a.index);
+    return updates.length ? updates[0].data.status : null;
   }
 
   getReferralsForFacility(facilityId, direction) {
     const field = direction === "incoming" ? "toFacility" : "fromFacility";
     return this.chain
       .filter(b => b.type === "REFERRAL_ISSUED" && b.data?.[field] === facilityId)
-      .map(b => ({
-        referralId:       b.data.referralId,
-        patientNupi:      b.data.nupi,
-        fromFacilityId:   b.data.fromFacility,
-        fromFacilityName: this.getFacility(b.data.fromFacility)?.name || b.data.fromFacility,
-        toFacilityId:     b.data.toFacility,
-        toFacilityName:   this.getFacility(b.data.toFacility)?.name   || b.data.toFacility,
-        reason:           b.data.reason,
-        urgency:          b.data.urgency   || "ROUTINE",
-        issuedBy:         b.data.issuedBy  || null,
-        blockIndex:       b.index,
-        createdAt:        b.timestamp,
-      }));
+      .map(b => {
+        const latestStatus = this._getReferralLatestStatus(b.data.referralId);
+        return {
+          referralId:       b.data.referralId,
+          patientNupi:      b.data.nupi,
+          patientName:      b.data.patientName   || null,
+          fromFacilityId:   b.data.fromFacility,
+          fromFacilityName: this.getFacility(b.data.fromFacility)?.name || b.data.fromFacility,
+          toFacilityId:     b.data.toFacility,
+          toFacilityName:   this.getFacility(b.data.toFacility)?.name   || b.data.toFacility,
+          reason:           b.data.reason,
+          urgency:          b.data.urgency       || "ROUTINE",
+          issuedBy:         b.data.issuedBy      || null,
+          clinicalNotes:    b.data.clinicalNotes  || null,
+          status:           latestStatus          || "pending",
+          blockIndex:       b.index,
+          createdAt:        b.timestamp,
+        };
+      });
   }
 
   // ── Audit & Integrity ───────────────────────────────────────────
