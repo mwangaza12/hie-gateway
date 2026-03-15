@@ -9,13 +9,17 @@ const router = Router();
 // ─── POST /api/patients/register ─────────────────────────────────────────────
 router.post("/register", requireFacility, async (req, res) => {
   try {
-    const { nationalId, dob, name, securityQuestion, securityAnswer, pin } = req.body;
+    const {
+      nationalId, dob, name, securityQuestion, securityAnswer, pin,
+      // FIX: accept full demographics so they are stored centrally on the chain.
+      // Without this, Facility B can only retrieve the patient's name — all other
+      // fields (phone, gender, county, etc.) were discarded at registration.
+      gender, phoneNumber, email, county, subCounty, ward, village,
+    } = req.body;
 
     if (!nationalId || !dob || !name || !securityQuestion || !securityAnswer || !pin)
       return res.status(400).json({ error: "nationalId, dob, name, securityQuestion, securityAnswer, pin required" });
 
-    // FIX: was 4–6 digits maximum — raised to 4–8 to match Flutter (maxLength=8)
-    //      and the SupportFacility web frontend (maxLength=8). 4 is still the minimum.
     const pinStr = pin.toString();
     if (pinStr.length < 4 || pinStr.length > 8)
       return res.status(400).json({ error: "PIN must be 4–8 digits" });
@@ -23,8 +27,16 @@ router.post("/register", requireFacility, async (req, res) => {
     const result = await chain.registerPatient({
       nationalId, dob, name,
       securityQuestion, securityAnswer,
-      pin:        pinStr,
-      facilityId: req.facilityId,
+      pin:         pinStr,
+      facilityId:  req.facilityId,
+      // demographics
+      gender:      gender      || null,
+      phoneNumber: phoneNumber || null,
+      email:       email       || null,
+      county:      county      || null,
+      subCounty:   subCounty   || null,
+      ward:        ward        || null,
+      village:     village     || null,
     });
 
     await logAudit({

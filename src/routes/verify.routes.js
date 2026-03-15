@@ -94,16 +94,27 @@ router.post("/answer", requireFacility, async (req, res) => {
       ipAddress:   req.ip,
     });
 
+    const pd = verification.patient;
     res.json({
       success: true,
       ...tokenData,
       patient: {
-        nupi:               verification.nupi,
-        name:               verification.patient.name,
-        registeredFacilityId: verification.patient.facilityId,
-        registeredFacility:   regFac?.name   || verification.patient.facilityId,
+        nupi:                 pd.nupi,
+        name:                 pd.name,
+        registeredFacilityId: pd.facilityId,
+        registeredFacility:   regFac?.name   || pd.facilityId,
         facilityCounty:       regFac?.county || '',
-        isCurrentFacility:    verification.patient.facilityId === req.facilityId,
+        isCurrentFacility:    pd.facilityId === req.facilityId,
+        // FIX: include demographics stored at registration time.
+        // Without this, Facility B receives only the patient's name.
+        dob:         pd.dob         || '',
+        gender:      pd.gender      || '',
+        phoneNumber: pd.phoneNumber || '',
+        email:       pd.email       || '',
+        county:      pd.county      || '',
+        subCounty:   pd.subCounty   || '',
+        ward:        pd.ward        || '',
+        village:     pd.village     || '',
       },
       facilitiesVisited,
       encounterIndex,
@@ -135,16 +146,26 @@ router.post("/pin", requireFacility, async (req, res) => {
 
     const regFac2 = chain.getFacility(verification.patient.facilityId);
 
+    const pd2 = verification.patient;
     res.json({
       success: true,
       ...tokenData,
       patient: {
-        nupi:                 verification.nupi,
-        name:                 verification.patient.name,
-        registeredFacilityId: verification.patient.facilityId,
-        registeredFacility:   regFac2?.name   || verification.patient.facilityId,
+        nupi:                 pd2.nupi,
+        name:                 pd2.name,
+        registeredFacilityId: pd2.facilityId,
+        registeredFacility:   regFac2?.name   || pd2.facilityId,
         facilityCounty:       regFac2?.county || '',
-        isCurrentFacility:    verification.patient.facilityId === req.facilityId,
+        isCurrentFacility:    pd2.facilityId === req.facilityId,
+        // FIX: include demographics
+        dob:         pd2.dob         || '',
+        gender:      pd2.gender      || '',
+        phoneNumber: pd2.phoneNumber || '',
+        email:       pd2.email       || '',
+        county:      pd2.county      || '',
+        subCounty:   pd2.subCounty   || '',
+        ward:        pd2.ward        || '',
+        village:     pd2.village     || '',
       },
       facilitiesVisited,
       encounterIndex,

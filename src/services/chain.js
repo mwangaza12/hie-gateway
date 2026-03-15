@@ -174,7 +174,8 @@ export class AfyaChain {
 
   // ── Patients ────────────────────────────────────────────────────
 
-  async registerPatient({ nationalId, dob, name, securityQuestion, securityAnswer, pin, facilityId }) {
+  async registerPatient({ nationalId, dob, name, securityQuestion, securityAnswer, pin, facilityId,
+                           gender, phoneNumber, email, county, subCounty, ward, village }) {
     await this.ready();
     const nupi = AfyaChain.genNupi(nationalId, dob);
     if (this.patients[nupi]) return { success: true, nupi, alreadyExists: true };
@@ -189,7 +190,22 @@ export class AfyaChain {
       dobYear: dob.split("-")[0], registeredAt: facilityId,
     });
 
-    this.patients[nupi] = { nupi, name, facilityId, facilitiesVisited: [facilityId], registeredAt: block.timestamp, blockIndex: block.index };
+    this.patients[nupi] = {
+      nupi, name, facilityId,
+      facilitiesVisited: [facilityId],
+      registeredAt: block.timestamp,
+      blockIndex:   block.index,
+      // FIX: store demographics so any facility can retrieve them
+      // without proxying back to the registering facility's FHIR server.
+      dob:         dob         || null,
+      gender:      gender      || null,
+      phoneNumber: phoneNumber || null,
+      email:       email       || null,
+      county:      county      || null,
+      subCounty:   subCounty   || null,
+      ward:        ward        || null,
+      village:     village     || null,
+    };
 
     if (!this.consents[nupi]) this.consents[nupi] = [];
     this.consents[nupi].push({
@@ -298,7 +314,28 @@ export class AfyaChain {
     id.lockedUntil    = null;
     await this._append("IDENTITY_VERIFIED", { nupi, method: type, idMasked: nationalId.slice(0, 2) + "****" + nationalId.slice(-2) });
     await this._persist({ identity: nupi });
-    return { success: true, nupi, patient: this.patients[nupi] };
+    const p = this.patients[nupi];
+    return {
+      success: true,
+      nupi,
+      patient: {
+        // Core identity (always present)
+        nupi:        p.nupi,
+        name:        p.name,
+        facilityId:  p.facilityId,
+        registeredAt: p.registeredAt,
+        facilitiesVisited: p.facilitiesVisited,
+        // Full demographics (present if registered with the updated app)
+        dob:         p.dob         || null,
+        gender:      p.gender      || null,
+        phoneNumber: p.phoneNumber || null,
+        email:       p.email       || null,
+        county:      p.county      || null,
+        subCounty:   p.subCounty   || null,
+        ward:        p.ward        || null,
+        village:     p.village     || null,
+      },
+    };
   }
 
   // ── Referrals ───────────────────────────────────────────────────
