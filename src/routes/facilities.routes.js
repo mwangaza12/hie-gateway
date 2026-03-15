@@ -128,13 +128,16 @@ router.get('/:facilityId/firebase-config', async (req, res) => {
       });
 
     // Return facility info + Firebase credentials together
-    // so the app can display the facility name and init Firebase in one call
+    // so the app can display the facility name and init Firebase in one call.
+    // apiUrl is the facility's own backend URL — the Flutter app saves it so
+    // all subsequent calls go through the facility backend (not the gateway).
     res.json({
       success: true,
       facilityId:   data.facilityId,
       facilityName: data.name,
       county:       data.county    || '',
       subCounty:    data.subCounty || '',
+      apiUrl:       data.apiUrl    || '',   // ← facility backend URL
       firebaseConfig: {
         apiKey:            data.firebaseConfig.apiKey,
         appId:             data.firebaseConfig.appId,
