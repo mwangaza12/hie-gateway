@@ -1,3 +1,6 @@
+// hie-gateway-main/src/services/chain.js
+// COMPLETE UPDATED FILE WITH DISEASE PROGRAM SUPPORT
+
 import crypto from "crypto";
 import { db, cref, admin } from "./firebase.js";
 
@@ -120,28 +123,23 @@ export class AfyaChain {
     return { success: true, block };
   }
 
-
   async rotateApiKey(facilityId, rotatedBy) {
     await this.ready();
     const fac = this.facilities[facilityId];
     if (!fac)                    return { success: false, error: 'Facility not found' };
     if (fac.status !== 'ACTIVE') return { success: false, error: `Facility is ${fac.status} — reactivate before rotating key` };
 
-    // Generate a new API key the same way registration does
     const newApiKey  = 'FAC-' + AfyaChain.sha256(facilityId + Date.now() + 'ROTATE').substring(0, 32).toUpperCase();
     const newKeyHash = AfyaChain.sha256(newApiKey);
 
-    // Mint a block recording the rotation — old keyHash is preserved in
-    // the block for audit purposes but is no longer valid for auth
     const block = await this._append('FACILITY_KEY_ROTATED', {
       facilityId,
-      oldKeyHash:  fac.keyHash,   // audit trail only
+      oldKeyHash:  fac.keyHash,
       newKeyHash,
       rotatedBy,
       rotatedAt:   new Date().toISOString(),
     });
 
-    // Replace the active keyHash in memory and persist
     this.facilities[facilityId].keyHash = newKeyHash;
     await this._persist({ facility: facilityId });
 
@@ -203,6 +201,7 @@ export class AfyaChain {
       subCounty:   subCounty   || null,
       ward:        ward        || null,
       village:     village     || null,
+      diseasePrograms: [],  // ← NEW: Initialize empty disease programs array
     };
 
     if (!this.consents[nupi]) this.consents[nupi] = [];
@@ -218,6 +217,129 @@ export class AfyaChain {
 
   generateNupi(nationalId, dob) { return AfyaChain.genNupi(nationalId, dob); }
   getPatient(nupi)               { return this.patients[nupi] || null; }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // NEW: Disease Program Methods
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get disease programs (CarePlans) for a patient
+   */
+  getPatientDiseasePrograms(nupi) {
+    const patient = this.patients[nupi];
+    if (!patient) return [];
+
+    // Disease programs stored as array in patient record
+    return patient.diseasePrograms || [];
+  }
+
+  /**
+   * Enroll patient in disease program
+   */
+  enrollInDiseaseProgram({ nupi, programId, programName, startDate, conditions = [] }) {
+    const patient = this.patients[nupi];
+    if (!patient) throw new Error("Patient not found");
+
+    if (!patient.diseasePrograms) patient.diseasePrograms = [];
+
+    // Check if already enrolled
+    const existing = patient.diseasePrograms.find(p => p.id === programId);
+    if (existing) {
+      return { success: false, error: "Patient already enrolled in this program" };
+    }
+
+    const enrollmentDate = startDate || new Date().toISOString();
+    const facility = this.getFacility(patient.facilityId);
+
+    const program = {
+      id: programId,
+      programName,
+      status: "active",
+      enrollmentDate,
+      conditions, // Array of condition codes this program addresses
+      lastUpdated: new Date().toISOString(),
+      enrolledByFacility: facility?.name || "Unknown",
+      enrolledByFacilityId: patient.facilityId,
+    };
+
+    patient.diseasePrograms.push(program);
+
+    // Persist to Firestore
+    this._persistPatientSync(nupi);
+
+    // Add to blockchain
+    this._append("DISEASE_PROGRAM_ENROLLMENT", {
+      nupi,
+      programId,
+      programName,
+      facilityId: patient.facilityId,
+      enrollmentDate,
+      conditions,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { success: true, program };
+  }
+
+  /**
+   * Update disease program status
+   */
+  updateDiseaseProgramStatus({ nupi, programId, status, notes }) {
+    const patient = this.patients[nupi];
+    if (!patient || !patient.diseasePrograms) 
+      throw new Error("Patient or programs not found");
+
+    const program = patient.diseasePrograms.find(p => p.id === programId);
+    if (!program) throw new Error("Disease program not found");
+
+    const oldStatus = program.status;
+    program.status = status; // active, on-hold, completed
+    program.lastUpdated = new Date().toISOString();
+    if (notes) program.notes = notes;
+
+    if (status === 'completed') {
+      program.completedDate = new Date().toISOString();
+    }
+
+    this._persistPatientSync(nupi);
+
+    // Add status change to blockchain
+    this._append("DISEASE_PROGRAM_STATUS_CHANGE", {
+      nupi,
+      programId,
+      programName: program.programName,
+      oldStatus,
+      newStatus: status,
+      notes: notes || null,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { success: true, program };
+  }
+
+  /**
+   * Persist patient data to Firestore (synchronous for use in other methods)
+   */
+  _persistPatientSync(nupi) {
+    const patient = this.patients[nupi];
+    if (!patient) return;
+
+    // Use setImmediate to avoid blocking
+    setImmediate(async () => {
+      try {
+        await cref.patient(nupi).set({
+          ...patient,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } catch (err) {
+        console.error("Failed to persist patient:", err);
+      }
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // END: Disease Program Methods
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   // ── Encounters ──────────────────────────────────────────────────
 

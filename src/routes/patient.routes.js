@@ -1,3 +1,8 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE 1: hie-gateway-main/src/routes/patient.routes.js
+// COMPLETE UPDATED FILE
+// ═══════════════════════════════════════════════════════════════════════════════
+
 import { Router }            from "express";
 import { chain }             from "../services/chain.js";
 import { logAudit }          from "../services/audit.js";
@@ -230,9 +235,6 @@ router.get("/:nupi/history", requireFacility, async (req, res) => {
 });
 
 // ─── GET /api/patients/:nupi/encounters ──────────────────────────────────────
-// Returns the encounter index for a patient directly from the blockchain.
-// No FHIR proxy — works even when the registering facility is offline.
-// Facility B uses this to show encounter history on the lookup page.
 router.get("/:nupi/encounters", requireFacility, async (req, res) => {
   try {
     const { nupi } = req.params;
@@ -253,6 +255,114 @@ router.get("/:nupi/encounters", requireFacility, async (req, res) => {
     });
 
     res.json({ success: true, nupi, encounters, count: encounters.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: GET /api/patients/:nupi/disease-programs
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get("/:nupi/disease-programs", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+
+    const patient = chain.getPatient(nupi);
+    if (!patient)
+      return res.status(404).json({ error: "Patient not on AfyaNet" });
+
+    const diseasePrograms = chain.getPatientDiseasePrograms(nupi);
+
+    await logAudit({
+      event:       "patient_disease_programs_accessed",
+      patientNupi: nupi,
+      facilityId:  req.facilityId,
+      success:     true,
+      metadata:    { count: diseasePrograms.length },
+      ipAddress:   req.ip,
+    });
+
+    res.json({ 
+      success: true, 
+      nupi, 
+      diseasePrograms,
+      count: diseasePrograms.length 
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: POST /api/patients/:nupi/disease-programs/enroll
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post("/:nupi/disease-programs/enroll", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+    const { programId, programName, startDate, conditions } = req.body;
+
+    if (!programId || !programName)
+      return res.status(400).json({ error: "programId and programName required" });
+
+    const patient = chain.getPatient(nupi);
+    if (!patient)
+      return res.status(404).json({ error: "Patient not on AfyaNet" });
+
+    const result = chain.enrollInDiseaseProgram({
+      nupi,
+      programId,
+      programName,
+      startDate: startDate || new Date().toISOString(),
+      conditions: conditions || [],
+    });
+
+    await logAudit({
+      event:       "patient_enrolled_in_disease_program",
+      patientNupi: nupi,
+      facilityId:  req.facilityId,
+      success:     true,
+      metadata:    { programId, programName },
+      ipAddress:   req.ip,
+    });
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: PATCH /api/patients/:nupi/disease-programs/:programId
+// ═══════════════════════════════════════════════════════════════════════════════
+router.patch("/:nupi/disease-programs/:programId", requireFacility, async (req, res) => {
+  try {
+    const { nupi, programId } = req.params;
+    const { status, notes } = req.body;
+
+    if (!status)
+      return res.status(400).json({ error: "status required (active, on-hold, completed)" });
+
+    const patient = chain.getPatient(nupi);
+    if (!patient)
+      return res.status(404).json({ error: "Patient not on AfyaNet" });
+
+    const result = chain.updateDiseaseProgramStatus({
+      nupi,
+      programId,
+      status,
+      notes,
+    });
+
+    await logAudit({
+      event:       "disease_program_status_updated",
+      patientNupi: nupi,
+      facilityId:  req.facilityId,
+      success:     true,
+      metadata:    { programId, status },
+      ipAddress:   req.ip,
+    });
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
