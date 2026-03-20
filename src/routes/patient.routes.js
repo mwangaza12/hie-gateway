@@ -308,7 +308,7 @@ router.post("/:nupi/disease-programs/enroll", requireFacility, async (req, res) 
     if (!patient)
       return res.status(404).json({ error: "Patient not on AfyaNet" });
 
-    const result = chain.enrollInDiseaseProgram({
+    const result = await chain.enrollInDiseaseProgram({
       nupi,
       programId,
       programName,
@@ -346,7 +346,7 @@ router.patch("/:nupi/disease-programs/:programId", requireFacility, async (req, 
     if (!patient)
       return res.status(404).json({ error: "Patient not on AfyaNet" });
 
-    const result = chain.updateDiseaseProgramStatus({
+    const result = await chain.updateDiseaseProgramStatus({
       nupi,
       programId,
       status,

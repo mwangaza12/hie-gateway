@@ -15,9 +15,10 @@ export const db = admin.firestore();
 console.log("✅ Firebase Firestore connected");
 
 export const col = {
-  facilities:   db.collection("facilities"),
-  accessTokens: db.collection("access_tokens"),
-  auditLog:     db.collection("audit_log"),
+  facilities:    db.collection("facilities"),
+  accessTokens:  db.collection("access_tokens"),
+  auditLog:      db.collection("audit_log"),
+  failedPersists: db.collection("failed_persists"),
 };
 
 const BC = "hie_chain";

@@ -234,15 +234,15 @@ export class AfyaChain {
   }
 
   /**
-   * Enroll patient in disease program
+   * Enroll patient in disease program.
+   * Async so the route can await it and surface Firestore errors cleanly.
    */
-  enrollInDiseaseProgram({ nupi, programId, programName, startDate, conditions = [] }) {
+  async enrollInDiseaseProgram({ nupi, programId, programName, startDate, conditions = [] }) {
     const patient = this.patients[nupi];
     if (!patient) throw new Error("Patient not found");
 
     if (!patient.diseasePrograms) patient.diseasePrograms = [];
 
-    // Check if already enrolled
     const existing = patient.diseasePrograms.find(p => p.id === programId);
     if (existing) {
       return { success: false, error: "Patient already enrolled in this program" };
@@ -256,19 +256,18 @@ export class AfyaChain {
       programName,
       status: "active",
       enrollmentDate,
-      conditions, // Array of condition codes this program addresses
+      conditions,
       lastUpdated: new Date().toISOString(),
-      enrolledByFacility: facility?.name || "Unknown",
+      enrolledByFacility:   facility?.name || "Unknown",
       enrolledByFacilityId: patient.facilityId,
     };
 
     patient.diseasePrograms.push(program);
 
-    // Persist to Firestore
-    this._persistPatientSync(nupi);
+    // Persist to Firestore with retry — must succeed before chain block is written
+    await this._retryPersistPatient(nupi, "DISEASE_PROGRAM_ENROLLMENT");
 
-    // Add to blockchain
-    this._append("DISEASE_PROGRAM_ENROLLMENT", {
+    await this._append("DISEASE_PROGRAM_ENROLLMENT", {
       nupi,
       programId,
       programName,
@@ -282,29 +281,27 @@ export class AfyaChain {
   }
 
   /**
-   * Update disease program status
+   * Update disease program status.
+   * Async so the route can await it and surface Firestore errors cleanly.
    */
-  updateDiseaseProgramStatus({ nupi, programId, status, notes }) {
+  async updateDiseaseProgramStatus({ nupi, programId, status, notes }) {
     const patient = this.patients[nupi];
-    if (!patient || !patient.diseasePrograms) 
+    if (!patient || !patient.diseasePrograms)
       throw new Error("Patient or programs not found");
 
     const program = patient.diseasePrograms.find(p => p.id === programId);
     if (!program) throw new Error("Disease program not found");
 
     const oldStatus = program.status;
-    program.status = status; // active, on-hold, completed
+    program.status      = status;
     program.lastUpdated = new Date().toISOString();
     if (notes) program.notes = notes;
+    if (status === "completed") program.completedDate = new Date().toISOString();
 
-    if (status === 'completed') {
-      program.completedDate = new Date().toISOString();
-    }
+    // Persist to Firestore with retry — must succeed before chain block is written
+    await this._retryPersistPatient(nupi, "DISEASE_PROGRAM_STATUS_CHANGE");
 
-    this._persistPatientSync(nupi);
-
-    // Add status change to blockchain
-    this._append("DISEASE_PROGRAM_STATUS_CHANGE", {
+    await this._append("DISEASE_PROGRAM_STATUS_CHANGE", {
       nupi,
       programId,
       programName: program.programName,
@@ -318,23 +315,77 @@ export class AfyaChain {
   }
 
   /**
-   * Persist patient data to Firestore (synchronous for use in other methods)
+   * Persist a patient document to Firestore with exponential-backoff retry.
+   *
+   * Attempts: 1 immediate + up to MAX_RETRIES more, doubling the delay each
+   * time (1 s → 2 s → 4 s).  On final failure the patient snapshot and the
+   * operation name are written to col.failedPersists so an admin or background
+   * job can replay them without losing data.
+   *
+   * @param {string} nupi        - Patient NUPI (document key)
+   * @param {string} operation   - Label for failure logging (e.g. "DISEASE_PROGRAM_ENROLLMENT")
+   * @param {number} [maxRetries=3]
    */
-  _persistPatientSync(nupi) {
+  async _retryPersistPatient(nupi, operation, maxRetries = 3) {
     const patient = this.patients[nupi];
     if (!patient) return;
 
-    // Use setImmediate to avoid blocking
-    setImmediate(async () => {
+    const payload = {
+      ...patient,
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    let attempt = 0;
+    let delayMs  = 1000;
+
+    while (attempt <= maxRetries) {
       try {
-        await cref.patient(nupi).set({
-          ...patient,
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
+        await cref.patient(nupi).set(payload, { merge: true });
+        if (attempt > 0) {
+          console.log(`⛓  _retryPersistPatient: ${nupi} succeeded on attempt ${attempt + 1}`);
+        }
+        return;
       } catch (err) {
-        console.error("Failed to persist patient:", err);
+        attempt++;
+        if (attempt > maxRetries) break;
+        console.warn(
+          `⛓  _retryPersistPatient: attempt ${attempt}/${maxRetries} failed for ${nupi} ` +
+          `(${operation}) — retrying in ${delayMs}ms. Error: ${err.message}`
+        );
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        delayMs *= 2;
       }
-    });
+    }
+
+    // All retries exhausted — write to dead-letter collection for manual replay
+    const failureId = `${nupi}_${Date.now()}`;
+    console.error(
+      `⛓  _retryPersistPatient: all ${maxRetries} retries exhausted for ${nupi} ` +
+      `(${operation}). Writing to failed_persists/${failureId}`
+    );
+
+    try {
+      await col.failedPersists.doc(failureId).set({
+        nupi,
+        operation,
+        patientSnapshot: patient,
+        failedAt:        new Date().toISOString(),
+        retries:         maxRetries,
+        resolved:        false,
+      });
+    } catch (deadLetterErr) {
+      // Absolute last resort — at least the in-memory state is correct
+      console.error(
+        `⛓  _retryPersistPatient: CRITICAL — failed_persists write also failed for ${nupi}. ` +
+        `Error: ${deadLetterErr.message}`
+      );
+    }
+
+    // Re-throw so the caller (route handler) can return a 500 to the client
+    // rather than silently returning success with a diverged Firestore state.
+    throw new Error(
+      `Firestore persist failed for patient ${nupi} after ${maxRetries} retries (${operation})`
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
