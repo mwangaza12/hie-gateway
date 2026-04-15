@@ -17,6 +17,7 @@ import verifyRoutes     from "./routes/verify.routes.js";
 import fhirRoutes       from "./routes/fhir.routes.js";
 import referralRoutes   from "./routes/referral.routes.js";
 import facilitiesRoutes from "./routes/facilities.routes.js";
+import queueRoutes from "./routes/queue.routes.js";
 
 import { logAudit }        from "./services/audit.js";
 import { col, admin }      from "./services/firebase.js";
@@ -38,6 +39,7 @@ app.use("/api/patients",   patientRoutes);
 app.use("/api/verify",     verifyRoutes);     // verify routes live at /api/verify/*
 app.use("/api/fhir",       fhirRoutes);
 app.use("/api/referrals",  referralRoutes);
+app.use("/api/queue",      queueRoutes);    // requires X-Facility-Id + X-Api-Key
 
 // ── Audit log ─────────────────────────────────────────────────────
 app.get("/api/audit", requireFacility, async (req, res) => {
