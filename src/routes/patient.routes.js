@@ -119,6 +119,20 @@ router.post("/encounter", requireFacility, async (req, res) => {
   }
 });
 
+router.patch("/:nupi/contact", requireFacility, async (req, res) => {
+  const { nupi } = req.params;
+  const { phoneNumber, email } = req.body;
+
+  const patient = chain.getPatient(nupi);
+  if (!patient) return res.status(404).json({ error: "Patient not found" });
+
+  if (phoneNumber) patient.phoneNumber = phoneNumber;
+  if (email) patient.email = email;
+
+  await chain._retryPersistPatient(nupi, "CONTACT_UPDATED");
+  res.json({ success: true });
+});
+
 router.post("/token", requireFacility, async (req, res) => {
   try {
     const { nupi, pin, securityAnswer } = req.body;
