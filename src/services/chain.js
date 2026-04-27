@@ -426,8 +426,23 @@ export class AfyaChain {
         blockIndex:    e.blockIndex,
       }));
   }
-  getPatientEncounterIndex(nupi) { return Object.values(this.encounters).filter(e => e.nupi === nupi); }
+  // In chain.js getPatientEncounterIndex method:
+  getPatientEncounterIndex(nupi) {
+    const encounters = this.getPatientEncounterList(nupi);
+    console.log('🔍 Raw encounters for', nupi, ':', JSON.stringify(encounters, null, 2));
+    return encounters;
+  }
 
+  // In your chain service, add a method to list all encounters:
+  getAllEncounters() {
+    const allEncounters = [];
+    for (const block of this.chain) {
+      if (block.data?.type === 'encounter') {
+        allEncounters.push(block.data);
+      }
+    }
+    return allEncounters;
+  }
   // ── Consents ────────────────────────────────────────────────────
 
   async grantConsent({ nupi, facilityId, consentType, durationDays, notes, grantedBy }) {
