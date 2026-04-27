@@ -8,6 +8,26 @@ import { requireFacility, requireAccessToken } from "../middleware/auth.js";
 
 const router = Router();
 
+// ── Consent check helper ──────────────────────────────────────────────────────
+// Returns true if the requesting facility may access clinical records for nupi.
+// A patient always has consent for their own registered facility.
+// Cross-facility access requires an ACTIVE consent record on the chain.
+function checkConsent(nupi, requestingFacilityId, res) {
+  if (!chain.hasConsent(nupi, requestingFacilityId)) {
+    logAudit({
+      event: "consent_denied", patientNupi: nupi,
+      facilityId: requestingFacilityId, success: false,
+    });
+    res.status(403).json(FHIR.operationOutcome(
+      "error", "forbidden",
+      "Patient has not granted consent for this facility to access their clinical records. " +
+      "Request consent via POST /api/patients/:nupi/consent."
+    ));
+    return false;
+  }
+  return true;
+}
+
 async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res) {
   const facDoc = await col.facilities.doc(targetFacilityId).get();
   if (!facDoc.exists || !facDoc.data().active)
@@ -38,16 +58,21 @@ async function fetchFromFacility(nupi, resourceType, targetFacilityId, req, res)
 }
 
 // ─── GET /api/fhir/Patient/:nupi ──────────────────────────────────────────────
+// Demographics only — consent required for cross-facility access.
 router.get("/Patient/:nupi", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi } = req.params;
     const facilityId = req.query.facility || req.facilityId;
 
+    // Cross-facility request: enforce consent
+    if (req.query.facility && req.query.facility !== req.facilityId) {
+      if (!checkConsent(nupi, req.facilityId, res)) return;
+    }
+
     if (!req.query.facility) {
       console.warn(
         `⚠️  GET /fhir/Patient/${nupi} called without ?facility param. ` +
-        `Falling back to requesting facility ${req.facilityId}. ` +
-        `Demographics will be empty for cross-facility patients.`
+        `Falling back to requesting facility ${req.facilityId}.`
       );
     }
 
@@ -60,9 +85,11 @@ router.get("/Patient/:nupi", requireFacility, requireAccessToken, async (req, re
 // ─── GET /api/fhir/Patient/:nupi/Encounter ────────────────────────────────────
 router.get("/Patient/:nupi/Encounter", requireFacility, requireAccessToken, async (req, res) => {
   try {
+    const { nupi } = req.params;
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
-    await fetchFromFacility(req.params.nupi, "encounter", facilityId, req, res);
+    if (!checkConsent(nupi, req.facilityId, res)) return;
+    await fetchFromFacility(nupi, "encounter", facilityId, req, res);
   } catch (err) {
     res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
   }
@@ -71,9 +98,11 @@ router.get("/Patient/:nupi/Encounter", requireFacility, requireAccessToken, asyn
 // ─── GET /api/fhir/Patient/:nupi/Observation ──────────────────────────────────
 router.get("/Patient/:nupi/Observation", requireFacility, requireAccessToken, async (req, res) => {
   try {
+    const { nupi } = req.params;
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
-    await fetchFromFacility(req.params.nupi, "observation", facilityId, req, res);
+    if (!checkConsent(nupi, req.facilityId, res)) return;
+    await fetchFromFacility(nupi, "observation", facilityId, req, res);
   } catch (err) {
     res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
   }
@@ -82,9 +111,11 @@ router.get("/Patient/:nupi/Observation", requireFacility, requireAccessToken, as
 // ─── GET /api/fhir/Patient/:nupi/Condition ────────────────────────────────────
 router.get("/Patient/:nupi/Condition", requireFacility, requireAccessToken, async (req, res) => {
   try {
+    const { nupi } = req.params;
     const facilityId = req.query.facility;
     if (!facilityId) return res.status(400).json(FHIR.operationOutcome("error", "required", "?facility=FACILITY_ID required"));
-    await fetchFromFacility(req.params.nupi, "condition", facilityId, req, res);
+    if (!checkConsent(nupi, req.facilityId, res)) return;
+    await fetchFromFacility(nupi, "condition", facilityId, req, res);
   } catch (err) {
     res.status(500).json(FHIR.operationOutcome("error", "exception", err.message));
   }
@@ -94,6 +125,10 @@ router.get("/Patient/:nupi/Condition", requireFacility, requireAccessToken, asyn
 router.get("/Patient/:nupi/\\$everything", requireFacility, requireAccessToken, async (req, res) => {
   try {
     const { nupi } = req.params;
+
+    // Enforce consent before serving any clinical data
+    if (!checkConsent(nupi, req.facilityId, res)) return;
+
     const registeredFacilityId = req.query.registeredFacility || null;
 
     console.log(`🌐 $everything for ${nupi} — requested by ${req.facilityId}, registeredFacility=${registeredFacilityId ?? 'not provided'}`);

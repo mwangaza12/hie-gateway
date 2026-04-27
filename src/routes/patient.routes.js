@@ -368,4 +368,71 @@ router.patch("/:nupi/disease-programs/:programId", requireFacility, async (req, 
   }
 });
 
+// ─── POST /api/patients/:nupi/consent ────────────────────────────────────────
+// Grant a facility consent to access this patient's clinical records.
+// Called during patient lookup — the patient verifies identity first,
+// then the clinician requests consent on their behalf at the bedside.
+//
+// Body: { facilityId, consentType, durationDays, notes }
+//   facilityId   — facility being granted access (defaults to requesting facility)
+//   consentType  — "FULL_ACCESS" | "ENCOUNTER_ONLY" | "DEMOGRAPHICS_ONLY"
+//   durationDays — optional; null = indefinite
+//   notes        — optional free-text reason
+router.post("/:nupi/consent", requireFacility, async (req, res) => {
+  try {
+    const { nupi }   = req.params;
+    const { facilityId = req.facilityId, consentType = "FULL_ACCESS", durationDays, notes } = req.body;
+
+    const patient = chain.getPatient(nupi);
+    if (!patient) return res.status(404).json({ success: false, error: "Patient not on AfyaNet" });
+
+    const result = await chain.grantConsent({
+      nupi,
+      facilityId,
+      consentType,
+      durationDays: durationDays ? parseInt(durationDays) : null,
+      notes,
+      grantedBy: `${req.facilityId}:clinician`,
+    });
+
+    await logAudit({
+      event: "consent_granted", patientNupi: nupi,
+      facilityId: req.facilityId, success: true,
+      metadata: { grantedTo: facilityId, consentType, durationDays },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── DELETE /api/patients/:nupi/consent/:consentId ───────────────────────────
+// Revoke a previously granted consent.
+router.delete("/:nupi/consent/:consentId", requireFacility, async (req, res) => {
+  try {
+    const { nupi, consentId } = req.params;
+    const result = await chain.revokeConsent(nupi, consentId, req.facilityId);
+    if (!result.success) return res.status(404).json(result);
+
+    await logAudit({
+      event: "consent_revoked", patientNupi: nupi,
+      facilityId: req.facilityId, success: true,
+      metadata: { consentId },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── GET /api/patients/:nupi/consents ────────────────────────────────────────
+// List all consents for a patient.
+router.get("/:nupi/consents", requireFacility, (req, res) => {
+  res.json({ success: true, consents: chain.listConsents(req.params.nupi) });
+});
+
 export default router;
