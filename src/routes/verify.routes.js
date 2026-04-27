@@ -75,7 +75,10 @@ router.post("/answer", requireFacility, async (req, res) => {
     }
 
     const tokenData         = await issueAccessToken(verification.nupi, req.facilityId, "security_question");
-    const encounterIndex    = chain.getPatientEncounterIndex(verification.nupi);
+    // In verify.routes.js line 78, BEFORE sending response:
+    const encounterIndex = chain.getPatientEncounterIndex(verification.nupi);
+    console.log('📊 EncounterIndex for', verification.nupi, ':', encounterIndex);
+    console.log('📊 Number of encounters:', encounterIndex?.length || 0);
     const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
       const f = chain.getFacility(fid);
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
