@@ -79,6 +79,13 @@ router.post("/answer", requireFacility, async (req, res) => {
     const encounterIndex = chain.getPatientEncounterIndex(verification.nupi);
     console.log('📊 EncounterIndex for', verification.nupi, ':', encounterIndex);
     console.log('📊 Number of encounters:', encounterIndex?.length || 0);
+        // ADD THIS:
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('📊 Verification Response Debug:');
+    console.log('  NUPI:', verification.nupi);
+    console.log('  Encounters:', JSON.stringify(encounterIndex, null, 2));
+    console.log('  Count:', encounterIndex?.length || 0);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     const facilitiesVisited = chain.getPatientFacilities(verification.nupi).map(fid => {
       const f = chain.getFacility(fid);
       return { facilityId: fid, name: f?.name || "Unknown", county: f?.county };
