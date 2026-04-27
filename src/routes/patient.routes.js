@@ -187,11 +187,6 @@ router.get("/:nupi", requireFacility, async (req, res) => {
   }
 });
 
-// ─── GET /api/patients/:nupi/consents ────────────────────────────────────────
-router.get("/:nupi/consents", requireFacility, (req, res) => {
-  res.json({ success: true, consents: chain.listConsents(req.params.nupi) });
-});
-
 // ─── GET /api/patients/:nupi/history ─────────────────────────────────────────
 router.get("/:nupi/history", requireFacility, async (req, res) => {
   try {
@@ -436,3 +431,115 @@ router.get("/:nupi/consents", requireFacility, (req, res) => {
 });
 
 export default router;
+
+// ─── OTP CONSENT (Africa's Talking) ──────────────────────────────────────────
+import crypto from "crypto";
+import AfricasTalking from "africastalking";
+
+const _at = AfricasTalking({
+  apiKey:   process.env.AT_API_KEY  || "",
+  username: process.env.AT_USERNAME || "sandbox",
+});
+const _sms = _at.SMS;
+
+// In-memory OTP store. Replace with Redis/Firestore TTL collection for production.
+const _otpSessions = new Map();
+
+function _maskPhone(phone) {
+  if (!phone || phone.length < 7) return "registered number";
+  return phone.slice(0, 5) + "*".repeat(Math.max(0, phone.length - 8)).replace(/(.{3})/g, "$1 ").trimEnd() + " " + phone.slice(-3);
+}
+
+// ─── POST /api/patients/:nupi/consent/otp/request ────────────────────────────
+router.post("/:nupi/consent/otp/request", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+
+    const patient = chain.getPatient(nupi);
+    if (!patient) return res.status(404).json({ success: false, error: "Patient not on AfyaNet" });
+
+    const phone = patient.phoneNumber;
+    if (!phone) return res.status(400).json({ success: false, error: "No phone number registered for this patient" });
+
+    const otp       = String(Math.floor(100000 + Math.random() * 900000));
+    const sessionId = crypto.randomBytes(16).toString("hex");
+
+    _otpSessions.set(sessionId, {
+      nupi,
+      otp,
+      facilityId: req.facilityId,
+      expiresAt:  Date.now() + 10 * 60 * 1000, // 10 min TTL
+      attempts:   0,
+    });
+
+    await _sms.send({
+      to:      [phone],
+      message: `AfyaNet Consent: Your one-time code is ${otp}. Valid for 10 minutes. Do NOT share this code.`,
+      from:    process.env.AT_SENDER_ID || undefined,
+    });
+
+    await logAudit({
+      event: "consent_otp_sent", patientNupi: nupi,
+      facilityId: req.facilityId, success: true,
+      metadata: { sessionId },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, sessionId, maskedPhone: _maskPhone(phone) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── POST /api/patients/:nupi/consent/otp/verify ─────────────────────────────
+router.post("/:nupi/consent/otp/verify", requireFacility, async (req, res) => {
+  try {
+    const { nupi } = req.params;
+    const { sessionId, otp, consentType = "FULL_ACCESS", durationDays } = req.body;
+
+    if (!sessionId || !otp)
+      return res.status(400).json({ success: false, error: "sessionId and otp are required" });
+
+    const session = _otpSessions.get(sessionId);
+    if (!session)
+      return res.status(400).json({ success: false, error: "Invalid or expired session" });
+    if (session.nupi !== nupi)
+      return res.status(400).json({ success: false, error: "Session does not match patient" });
+    if (Date.now() > session.expiresAt) {
+      _otpSessions.delete(sessionId);
+      return res.status(400).json({ success: false, error: "OTP has expired. Please request a new one." });
+    }
+
+    session.attempts += 1;
+    if (session.attempts > 5) {
+      _otpSessions.delete(sessionId);
+      return res.status(400).json({ success: false, error: "Too many incorrect attempts. Please request a new OTP." });
+    }
+
+    if (session.otp !== String(otp).trim())
+      return res.status(400).json({ success: false, error: "Incorrect OTP. Please try again." });
+
+    // Correct — consume session and grant consent
+    _otpSessions.delete(sessionId);
+
+    const result = await chain.grantConsent({
+      nupi,
+      facilityId:   req.facilityId,
+      consentType,
+      durationDays: durationDays ? parseInt(durationDays) : null,
+      notes:        "Patient SMS-OTP consent verified at point of care",
+      grantedBy:    `${req.facilityId}:patient-otp`,
+    });
+
+    await logAudit({
+      event: "consent_granted", patientNupi: nupi,
+      facilityId: req.facilityId, success: true,
+      metadata: { consentType, durationDays, method: "sms_otp" },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});

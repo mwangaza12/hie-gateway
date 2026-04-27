@@ -20,6 +20,7 @@
     "express-rate-limit": "^7.1.5",
     "firebase-admin": "^12.0.0",
     "helmet": "^7.1.0",
+    "africastalking": "^0.6.4",
     "jsonwebtoken": "^9.0.2"
   },
   "devDependencies": {
